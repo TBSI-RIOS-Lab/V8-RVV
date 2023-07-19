@@ -113,6 +113,16 @@ void BaselineAssembler::JumpIf(Condition cc, Register lhs, const Operand& rhs,
                                Label* target, Label::Distance) {
   __ CompareAndBranch(lhs, rhs, cc, target);
 }
+#if V8_STATIC_ROOTS_BOOL
+void BaselineAssembler::JumpIfJSAnyIsPrimitive(Register heap_object,
+                                               Label* target,
+                                               Label::Distance distance) {
+  __ AssertNotSmi(heap_object);
+  ScratchRegisterScope temps(this);
+  Register scratch = temps.AcquireScratch();
+  __ JumpIfJSAnyIsPrimitive(heap_object, scratch, target, distance);
+}
+#endif  // V8_STATIC_ROOTS_BOOL
 void BaselineAssembler::JumpIfObjectTypeFast(Condition cc, Register object,
                                              InstanceType instance_type,
                                              Label* target,
@@ -438,8 +448,9 @@ void BaselineAssembler::TryLoadOptimizedOsrCode(Register scratch_and_result,
                                                 FeedbackSlot slot,
                                                 Label* on_result,
                                                 Label::Distance) {
-  __ TryLoadOptimizedOsrCode(scratch_and_result, feedback_vector, slot,
-                             on_result, Label::Distance::kFar);
+  __ TryLoadOptimizedOsrCode(scratch_and_result, CodeKind::MAGLEV,
+                             feedback_vector, slot, on_result,
+                             Label::Distance::kFar);
 }
 
 void BaselineAssembler::AddToInterruptBudgetAndJumpIfNotExceeded(

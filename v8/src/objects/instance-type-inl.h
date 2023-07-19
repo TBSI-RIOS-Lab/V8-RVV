@@ -7,9 +7,9 @@
 
 #include "src/base/bounds.h"
 #include "src/execution/isolate-utils-inl.h"
+#include "src/objects/instance-type-checker.h"
 #include "src/objects/instance-type.h"
 #include "src/objects/map-inl.h"
-#include "src/roots/static-roots.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -303,6 +303,11 @@ V8_INLINE bool IsThinString(Map map_object) {
 #endif
 }
 
+V8_INLINE constexpr bool IsReferenceComparable(InstanceType instance_type) {
+  return !IsString(instance_type) && !IsBigInt(instance_type) &&
+         instance_type != HEAP_NUMBER_TYPE;
+}
+
 V8_INLINE constexpr bool IsGcSafeCode(InstanceType instance_type) {
   return IsCode(instance_type);
 }
@@ -327,21 +332,9 @@ V8_INLINE bool IsFreeSpaceOrFiller(Map map_object) {
 
 }  // namespace InstanceTypeChecker
 
-#define TYPE_CHECKER(type, ...)                                                \
-  bool HeapObject::Is##type() const {                                          \
-    /* In general, parameterless IsBlah() must not be used for objects */      \
-    /* that might be located in external code space. Note that this version */ \
-    /* is still called from Blah::cast() methods but it's fine because in */   \
-    /* production builds these checks are not enabled anyway and debug */      \
-    /* builds are allowed to be a bit slower. */                               \
-    PtrComprCageBase cage_base = GetPtrComprCageBaseSlow(*this);               \
-    return HeapObject::Is##type(cage_base);                                    \
-  }                                                                            \
-  /* The cage_base passed here is must to be the base of the pointer */        \
-  /* compression cage where the Map space is allocated. */                     \
-  bool HeapObject::Is##type(PtrComprCageBase cage_base) const {                \
-    Map map_object = map(cage_base);                                           \
-    return InstanceTypeChecker::Is##type(map_object);                          \
+#define TYPE_CHECKER(type, ...)                  \
+  bool Map::Is##type##Map() const {              \
+    return InstanceTypeChecker::Is##type(*this); \
   }
 
 INSTANCE_TYPE_CHECKERS(TYPE_CHECKER)

@@ -5,12 +5,13 @@
 #ifndef V8_OBJECTS_DEBUG_OBJECTS_INL_H_
 #define V8_OBJECTS_DEBUG_OBJECTS_INL_H_
 
-#include "src/objects/debug-objects.h"
-
 #include "src/heap/heap-write-barrier-inl.h"
+#include "src/objects/bytecode-array-inl.h"
 #include "src/objects/code-inl.h"
+#include "src/objects/debug-objects.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/shared-function-info.h"
+#include "src/objects/string.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"

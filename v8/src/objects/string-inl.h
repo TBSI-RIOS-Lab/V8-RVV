@@ -11,6 +11,7 @@
 #include "src/handles/handles-inl.h"
 #include "src/heap/factory.h"
 #include "src/numbers/hash-seed-inl.h"
+#include "src/objects/instance-type-inl.h"
 #include "src/objects/name-inl.h"
 #include "src/objects/smi-inl.h"
 #include "src/objects/string-table-inl.h"
@@ -19,6 +20,8 @@
 #include "src/sandbox/external-pointer.h"
 #include "src/strings/string-hasher-inl.h"
 #include "src/strings/unicode-inl.h"
+#include "src/torque/runtime-macro-shims.h"
+#include "src/torque/runtime-support.h"
 #include "src/utils/utils.h"
 
 // Has to be the last include (doesn't have include guards):
@@ -128,19 +131,26 @@ TQ_OBJECT_CONSTRUCTORS_IMPL(ExternalString)
 TQ_OBJECT_CONSTRUCTORS_IMPL(ExternalOneByteString)
 TQ_OBJECT_CONSTRUCTORS_IMPL(ExternalTwoByteString)
 
-StringShape::StringShape(const String str)
-    : type_(str.map(kAcquireLoad).instance_type()) {
-  set_valid();
-  DCHECK_EQ(type_ & kIsNotStringMask, kStringTag);
-}
+static_assert(kTaggedCanConvertToRawObjects);
 
+StringShape::StringShape(const String str) : StringShape(Tagged<String>(str)) {}
 StringShape::StringShape(const String str, PtrComprCageBase cage_base)
-    : type_(str.map(cage_base, kAcquireLoad).instance_type()) {
+    : StringShape(Tagged<String>(str), cage_base) {}
+StringShape::StringShape(Map map) : StringShape(Tagged<Map>(map)) {}
+
+StringShape::StringShape(const Tagged<String> str)
+    : type_(str->map(kAcquireLoad).instance_type()) {
   set_valid();
   DCHECK_EQ(type_ & kIsNotStringMask, kStringTag);
 }
 
-StringShape::StringShape(Map map) : type_(map.instance_type()) {
+StringShape::StringShape(const Tagged<String> str, PtrComprCageBase cage_base)
+    : type_(str->map(cage_base, kAcquireLoad).instance_type()) {
+  set_valid();
+  DCHECK_EQ(type_ & kIsNotStringMask, kStringTag);
+}
+
+StringShape::StringShape(Tagged<Map> map) : type_(map->instance_type()) {
   set_valid();
   DCHECK_EQ(type_ & kIsNotStringMask, kStringTag);
 }
@@ -353,13 +363,13 @@ Char FlatStringReader::Get(int index) const {
 template <typename Char>
 class SequentialStringKey final : public StringTableKey {
  public:
-  SequentialStringKey(const base::Vector<const Char>& chars, uint64_t seed,
+  SequentialStringKey(base::Vector<const Char> chars, uint64_t seed,
                       bool convert = false)
       : SequentialStringKey(StringHasher::HashSequentialString<Char>(
                                 chars.begin(), chars.length(), seed),
                             chars, convert) {}
 
-  SequentialStringKey(int raw_hash_field, const base::Vector<const Char>& chars,
+  SequentialStringKey(int raw_hash_field, base::Vector<const Char> chars,
                       bool convert = false)
       : StringTableKey(raw_hash_field, chars.length()),
         chars_(chars),
@@ -718,19 +728,6 @@ base::Optional<String::FlatContent> String::TryGetFlatContentFromDirectString(
 
 String::FlatContent String::GetFlatContent(
     const DisallowGarbageCollection& no_gc) {
-#if DEBUG
-  // Check that this method is called only from the main thread.
-  {
-    Isolate* isolate;
-    // We don't have to check read only strings as those won't move.
-    //
-    // TODO(v8:12007): Currently character data is never overwritten for
-    // shared strings.
-    DCHECK_IMPLIES(GetIsolateFromHeapObject(*this, &isolate) && !InSharedHeap(),
-                   ThreadId::Current() == isolate->thread_id());
-  }
-#endif
-
   return GetFlatContent(no_gc, SharedStringAccessGuardIfNeeded::NotNeeded());
 }
 
@@ -851,7 +848,7 @@ uint16_t String::GetImpl(
     }
   };
 
-  return StringShape(*this)
+  return StringShape(Tagged<String>(*this))
       .DispatchToSpecificType<StringGetDispatcher, uint16_t>(
           *this, index, cage_base, access_guard);
 }
@@ -894,7 +891,7 @@ String String::GetUnderlying() const {
 }
 
 template <class Visitor>
-ConsString String::VisitFlat(Visitor* visitor, String string,
+ConsString String::VisitFlat(Visitor* visitor, Tagged<String> string,
                              const int offset) {
   DCHECK(!SharedStringAccessGuardIfNeeded::IsNeeded(string));
   return VisitFlat(visitor, string, offset,
@@ -903,11 +900,11 @@ ConsString String::VisitFlat(Visitor* visitor, String string,
 
 template <class Visitor>
 ConsString String::VisitFlat(
-    Visitor* visitor, String string, const int offset,
+    Visitor* visitor, Tagged<String> string, const int offset,
     const SharedStringAccessGuardIfNeeded& access_guard) {
   DisallowGarbageCollection no_gc;
   int slice_offset = offset;
-  const int length = string.length();
+  const int length = string->length();
   DCHECK(offset <= length);
   PtrComprCageBase cage_base = GetPtrComprCageBase(string);
   while (true) {
@@ -1016,14 +1013,15 @@ uint8_t SeqOneByteString::Get(
     const SharedStringAccessGuardIfNeeded& access_guard) const {
   USE(access_guard);
   DCHECK(index >= 0 && index < length());
-  return ReadField<byte>(kHeaderSize + index * kCharSize);
+  return ReadField<uint8_t>(kHeaderSize + index * kCharSize);
 }
 
 void SeqOneByteString::SeqOneByteStringSet(int index, uint16_t value) {
   DCHECK_GE(index, 0);
   DCHECK_LT(index, length());
   DCHECK_LE(value, kMaxOneByteCharCode);
-  WriteField<byte>(kHeaderSize + index * kCharSize, static_cast<byte>(value));
+  WriteField<uint8_t>(kHeaderSize + index * kCharSize,
+                      static_cast<uint8_t>(value));
 }
 
 void SeqOneByteString::SeqOneByteStringSetChars(int index,
@@ -1097,13 +1095,13 @@ inline int SeqTwoByteString::AllocatedSize() {
 }
 
 // static
-bool SeqOneByteString::IsCompatibleMap(Map map, ReadOnlyRoots roots) {
+bool SeqOneByteString::IsCompatibleMap(Tagged<Map> map, ReadOnlyRoots roots) {
   return map == roots.one_byte_string_map() ||
          map == roots.shared_one_byte_string_map();
 }
 
 // static
-bool SeqTwoByteString::IsCompatibleMap(Map map, ReadOnlyRoots roots) {
+bool SeqTwoByteString::IsCompatibleMap(Tagged<Map> map, ReadOnlyRoots roots) {
   return map == roots.string_map() || map == roots.shared_string_map();
 }
 

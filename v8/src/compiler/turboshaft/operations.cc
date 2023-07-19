@@ -10,14 +10,28 @@
 #include "src/base/logging.h"
 #include "src/base/optional.h"
 #include "src/base/platform/mutex.h"
+#include "src/codegen/bailout-reason.h"
 #include "src/codegen/machine-type.h"
 #include "src/common/globals.h"
 #include "src/compiler/backend/instruction-selector.h"
 #include "src/compiler/frame-states.h"
+#include "src/compiler/graph-visualizer.h"
 #include "src/compiler/machine-operator.h"
 #include "src/compiler/turboshaft/deopt-data.h"
 #include "src/compiler/turboshaft/graph.h"
 #include "src/handles/handles-inl.h"
+#include "src/handles/maybe-handles-inl.h"
+
+#ifdef DEBUG
+// For InWritableSharedSpace
+#include "src/objects/objects-inl.h"
+#endif
+
+namespace v8::internal {
+std::ostream& operator<<(std::ostream& os, AbortReason reason) {
+  return os << GetAbortReason(reason);
+}
+}  // namespace v8::internal
 
 namespace v8::internal::compiler::turboshaft {
 
@@ -84,7 +98,7 @@ bool ValidOpInputRep(
       std::cerr << "Turboshaft operation has input #" << input
                 << " with wrong arity.\n";
       std::cerr << "Input has results " << PrintCollection(input_reps)
-                << ", but expected at least " << *projection_index
+                << ", but expected at least " << (*projection_index + 1)
                 << " results.\n";
       return false;
     }
@@ -330,6 +344,8 @@ std::ostream& operator<<(std::ostream& os, ChangeOrDeoptOp::Kind kind) {
       return os << "Float64ToInt32";
     case ChangeOrDeoptOp::Kind::kFloat64ToInt64:
       return os << "Float64ToInt64";
+    case ChangeOrDeoptOp::Kind::kFloat64NotHole:
+      return os << "Float64NotHole";
   }
 }
 
@@ -353,15 +369,6 @@ std::ostream& operator<<(std::ostream& os, ChangeOp::Assumption assumption) {
   }
 }
 
-std::ostream& operator<<(std::ostream& os, Float64InsertWord32Op::Kind kind) {
-  switch (kind) {
-    case Float64InsertWord32Op::Kind::kLowHalf:
-      return os << "LowHalf";
-    case Float64InsertWord32Op::Kind::kHighHalf:
-      return os << "HighHalf";
-  }
-}
-
 std::ostream& operator<<(std::ostream& os, SelectOp::Implementation kind) {
   switch (kind) {
     case SelectOp::Implementation::kBranch:
@@ -379,13 +386,6 @@ std::ostream& operator<<(std::ostream& os, FrameConstantOp::Kind kind) {
       return os << "frame pointer";
     case FrameConstantOp::Kind::kParentFramePointer:
       return os << "parent frame pointer";
-  }
-}
-
-std::ostream& operator<<(std::ostream& os, TagKind kind) {
-  switch (kind) {
-    case TagKind::kSmiTag:
-      return os << "SmiTag";
   }
 }
 
@@ -413,7 +413,22 @@ void Operation::PrintOptions(std::ostream& os) const {
 }
 
 void PendingLoopPhiOp::PrintOptions(std::ostream& os) const {
-  os << "[" << rep << ", #o" << data.old_backedge_index.id() << "]";
+  os << "[" << rep << ", ";
+  switch (kind) {
+    case Kind::kOldGraphIndex:
+      os << "#o" << old_backedge_index();
+      break;
+    case Kind::kFromSeaOfNodes:
+      os << "Node(#" << old_backedge_node()->id() << ")";
+      break;
+    case Kind::kLabelParameter:
+      os << "PhiIndex(" << phi_index().index << ")";
+      break;
+    case Kind::kVariable:
+      os << "Variable(" << &variable().data() << ")";
+      break;
+  }
+  os << "]";
 }
 
 void ConstantOp::PrintOptions(std::ostream& os) const {
@@ -441,10 +456,10 @@ void ConstantOp::PrintOptions(std::ostream& os) const {
       os << "external: " << external_reference();
       break;
     case Kind::kHeapObject:
-      os << "heap object: " << handle();
+      os << "heap object: " << JSONEscaped(handle());
       break;
     case Kind::kCompressedHeapObject:
-      os << "compressed heap object: " << handle();
+      os << "compressed heap object: " << JSONEscaped(handle());
       break;
     case Kind::kRelocatableWasmCall:
       os << "relocatable wasm call: 0x"
@@ -512,6 +527,7 @@ void StoreOp::PrintOptions(std::ostream& os) const {
   if (element_size_log2 != 0)
     os << ", element size: 2^" << int{element_size_log2};
   if (offset != 0) os << ", offset: " << offset;
+  if (maybe_initializing_or_transitioning) os << ", initializing";
   os << "]";
 }
 
@@ -577,6 +593,54 @@ void FrameStateOp::PrintOptions(std::ostream& os) const {
     }
   }
   os << "]";
+}
+
+void FrameStateOp::Validate(const Graph& graph) const {
+  if (inlined) {
+    DCHECK(Get(graph, parent_frame_state()).Is<FrameStateOp>());
+  }
+  FrameStateData::Iterator it = data->iterator(state_values());
+  while (it.has_more()) {
+    switch (it.current_instr()) {
+      case FrameStateData::Instr::kInput: {
+        MachineType type;
+        OpIndex input;
+        it.ConsumeInput(&type, &input);
+        RegisterRepresentation rep =
+            RegisterRepresentation::FromMachineRepresentation(
+                type.representation());
+        if (rep == RegisterRepresentation::Tagged()) {
+          // The deoptimizer can handle compressed values.
+          rep = RegisterRepresentation::Compressed();
+        }
+        DCHECK(ValidOpInputRep(graph, input, rep));
+        break;
+      }
+      case FrameStateData::Instr::kUnusedRegister:
+        it.ConsumeUnusedRegister();
+        break;
+      case FrameStateData::Instr::kDematerializedObject: {
+        uint32_t id;
+        uint32_t field_count;
+        it.ConsumeDematerializedObject(&id, &field_count);
+        break;
+      }
+      case FrameStateData::Instr::kDematerializedObjectReference: {
+        uint32_t id;
+        it.ConsumeDematerializedObjectReference(&id);
+        break;
+      }
+      case FrameStateData::Instr::kArgumentsElements: {
+        CreateArgumentsType type;
+        it.ConsumeArgumentsElements(&type);
+        break;
+      }
+      case FrameStateData::Instr::kArgumentsLength: {
+        it.ConsumeArgumentsLength();
+        break;
+      }
+    }
+  }
 }
 
 void WordBinopOp::PrintOptions(std::ostream& os) const {
@@ -658,6 +722,31 @@ void FloatBinopOp::PrintOptions(std::ostream& os) const {
   os << "]";
 }
 
+void Word32PairBinopOp::PrintOptions(std::ostream& os) const {
+  os << "[";
+  switch (kind) {
+    case Kind::kAdd:
+      os << "Add";
+      break;
+    case Kind::kSub:
+      os << "Sub";
+      break;
+    case Kind::kMul:
+      os << "Mul";
+      break;
+    case Kind::kShiftLeft:
+      os << "ShiftLeft";
+      break;
+    case Kind::kShiftRightArithmetic:
+      os << "ShiftRightSigned";
+      break;
+    case Kind::kShiftRightLogical:
+      os << "ShiftRightUnsigned";
+      break;
+  }
+  os << "]";
+}
+
 void OverflowCheckedBinopOp::PrintOptions(std::ostream& os) const {
   os << "[";
   switch (kind) {
@@ -693,17 +782,40 @@ std::ostream& operator<<(std::ostream& os, const Block* b) {
   return os << b->index();
 }
 
-std::ostream& operator<<(std::ostream& os, OpProperties opProperties) {
-#define PRINT_PROPERTY(Name, ...)             \
-  if (opProperties == OpProperties::Name()) { \
-    return os << #Name;                       \
-  }
-
-  ALL_OP_PROPERTIES(PRINT_PROPERTY)
-
-#undef PRINT_PROPERTY
-
-  UNREACHABLE();
+std::ostream& operator<<(std::ostream& os, OpEffects effects) {
+  auto produce_consume = [](bool produces, bool consumes) {
+    if (!produces && !consumes) {
+      return "🁣";
+    } else if (produces && !consumes) {
+      return "🁤";
+    } else if (!produces && consumes) {
+      return "🁪";
+    } else if (produces && consumes) {
+      return "🁫";
+    }
+    UNREACHABLE();
+  };
+  os << produce_consume(effects.produces.load_heap_memory,
+                        effects.consumes.load_heap_memory);
+  os << produce_consume(effects.produces.load_off_heap_memory,
+                        effects.consumes.load_off_heap_memory);
+  os << "\u2003";  // em space
+  os << produce_consume(effects.produces.store_heap_memory,
+                        effects.consumes.store_heap_memory);
+  os << produce_consume(effects.produces.store_off_heap_memory,
+                        effects.consumes.store_off_heap_memory);
+  os << "\u2003";  // em space
+  os << produce_consume(effects.produces.before_raw_heap_access,
+                        effects.consumes.before_raw_heap_access);
+  os << produce_consume(effects.produces.after_raw_heap_access,
+                        effects.consumes.after_raw_heap_access);
+  os << "\u2003";  // em space
+  os << produce_consume(effects.produces.control_flow,
+                        effects.consumes.control_flow);
+  os << "\u2003";  // em space
+  os << (effects.can_create_identity ? "i" : "_");
+  os << " " << (effects.can_allocate ? "a" : "_");
+  return os;
 }
 
 void SwitchOp::PrintOptions(std::ostream& os) const {
@@ -761,111 +873,194 @@ std::ostream& operator<<(std::ostream& os,
   }
 }
 
-std::ostream& operator<<(std::ostream& os, ConvertToObjectOp::Kind kind) {
+std::ostream& operator<<(std::ostream& os, NumericKind kind) {
   switch (kind) {
-    case ConvertToObjectOp::Kind::kBigInt:
-      return os << "BigInt";
-    case ConvertToObjectOp::Kind::kBoolean:
+    case NumericKind::kFloat64Hole:
+      return os << "Float64Hole";
+    case NumericKind::kFinite:
+      return os << "Finite";
+    case NumericKind::kInteger:
+      return os << "Integer";
+    case NumericKind::kSafeInteger:
+      return os << "SafeInteger";
+    case NumericKind::kMinusZero:
+      return os << "MinusZero";
+    case NumericKind::kNaN:
+      return os << "NaN";
+  }
+}
+
+std::ostream& operator<<(std::ostream& os, ConvertOp::Kind kind) {
+  switch (kind) {
+    case ConvertOp::Kind::kObject:
+      return os << "Object";
+    case ConvertOp::Kind::kBoolean:
       return os << "Boolean";
-    case ConvertToObjectOp::Kind::kHeapNumber:
-      return os << "HeapNumber";
-    case ConvertToObjectOp::Kind::kNumber:
+    case ConvertOp::Kind::kNumber:
       return os << "Number";
-    case ConvertToObjectOp::Kind::kSmi:
+    case ConvertOp::Kind::kNumberOrOddball:
+      return os << "NumberOrOddball";
+    case ConvertOp::Kind::kPlainPrimitive:
+      return os << "PlainPrimitive";
+    case ConvertOp::Kind::kString:
+      return os << "String";
+    case ConvertOp::Kind::kSmi:
       return os << "Smi";
-    case ConvertToObjectOp::Kind::kString:
+  }
+}
+
+std::ostream& operator<<(std::ostream& os,
+                         ConvertUntaggedToJSPrimitiveOp::JSPrimitiveKind kind) {
+  switch (kind) {
+    case ConvertUntaggedToJSPrimitiveOp::JSPrimitiveKind::kBigInt:
+      return os << "BigInt";
+    case ConvertUntaggedToJSPrimitiveOp::JSPrimitiveKind::kBoolean:
+      return os << "Boolean";
+    case ConvertUntaggedToJSPrimitiveOp::JSPrimitiveKind::kHeapNumber:
+      return os << "HeapNumber";
+    case ConvertUntaggedToJSPrimitiveOp::JSPrimitiveKind::kNumber:
+      return os << "Number";
+    case ConvertUntaggedToJSPrimitiveOp::JSPrimitiveKind::kSmi:
+      return os << "Smi";
+    case ConvertUntaggedToJSPrimitiveOp::JSPrimitiveKind::kString:
       return os << "String";
   }
 }
 
 std::ostream& operator<<(
     std::ostream& os,
-    ConvertToObjectOp::InputInterpretation input_interpretation) {
+    ConvertUntaggedToJSPrimitiveOp::InputInterpretation input_interpretation) {
   switch (input_interpretation) {
-    case ConvertToObjectOp::InputInterpretation::kSigned:
+    case ConvertUntaggedToJSPrimitiveOp::InputInterpretation::kSigned:
       return os << "Signed";
-    case ConvertToObjectOp::InputInterpretation::kUnsigned:
+    case ConvertUntaggedToJSPrimitiveOp::InputInterpretation::kUnsigned:
       return os << "Unsigned";
-    case ConvertToObjectOp::InputInterpretation::kCharCode:
+    case ConvertUntaggedToJSPrimitiveOp::InputInterpretation::kCharCode:
       return os << "CharCode";
-    case ConvertToObjectOp::InputInterpretation::kCodePoint:
+    case ConvertUntaggedToJSPrimitiveOp::InputInterpretation::kCodePoint:
       return os << "CodePoint";
-  }
-}
-
-std::ostream& operator<<(std::ostream& os,
-                         ConvertToObjectOrDeoptOp::Kind kind) {
-  switch (kind) {
-    case ConvertToObjectOrDeoptOp::Kind::kSmi:
-      return os << "Smi";
   }
 }
 
 std::ostream& operator<<(
     std::ostream& os,
-    ConvertToObjectOrDeoptOp::InputInterpretation input_interpretation) {
+    ConvertUntaggedToJSPrimitiveOrDeoptOp::JSPrimitiveKind kind) {
+  switch (kind) {
+    case ConvertUntaggedToJSPrimitiveOrDeoptOp::JSPrimitiveKind::kSmi:
+      return os << "Smi";
+  }
+}
+
+std::ostream& operator<<(
+    std::ostream& os, ConvertUntaggedToJSPrimitiveOrDeoptOp::InputInterpretation
+                          input_interpretation) {
   switch (input_interpretation) {
-    case ConvertToObjectOrDeoptOp::InputInterpretation::kSigned:
+    case ConvertUntaggedToJSPrimitiveOrDeoptOp::InputInterpretation::kSigned:
       return os << "Signed";
-    case ConvertToObjectOrDeoptOp::InputInterpretation::kUnsigned:
+    case ConvertUntaggedToJSPrimitiveOrDeoptOp::InputInterpretation::kUnsigned:
       return os << "Unsigned";
   }
 }
 
 std::ostream& operator<<(std::ostream& os,
-                         ConvertObjectToPrimitiveOp::Kind kind) {
+                         ConvertJSPrimitiveToUntaggedOp::UntaggedKind kind) {
   switch (kind) {
-    case ConvertObjectToPrimitiveOp::Kind::kInt32:
+    case ConvertJSPrimitiveToUntaggedOp::UntaggedKind::kInt32:
       return os << "Int32";
-    case ConvertObjectToPrimitiveOp::Kind::kInt64:
+    case ConvertJSPrimitiveToUntaggedOp::UntaggedKind::kInt64:
       return os << "Int64";
-    case ConvertObjectToPrimitiveOp::Kind::kUint32:
+    case ConvertJSPrimitiveToUntaggedOp::UntaggedKind::kUint32:
       return os << "Uint32";
-    case ConvertObjectToPrimitiveOp::Kind::kBit:
+    case ConvertJSPrimitiveToUntaggedOp::UntaggedKind::kBit:
+      return os << "Bit";
+    case ConvertJSPrimitiveToUntaggedOp::UntaggedKind::kFloat64:
+      return os << "Float64";
+  }
+}
+
+std::ostream& operator<<(
+    std::ostream& os,
+    ConvertJSPrimitiveToUntaggedOp::InputAssumptions input_assumptions) {
+  switch (input_assumptions) {
+    case ConvertJSPrimitiveToUntaggedOp::InputAssumptions::kBoolean:
+      return os << "Boolean";
+    case ConvertJSPrimitiveToUntaggedOp::InputAssumptions::kSmi:
+      return os << "Smi";
+    case ConvertJSPrimitiveToUntaggedOp::InputAssumptions::kNumberOrOddball:
+      return os << "NumberOrOddball";
+    case ConvertJSPrimitiveToUntaggedOp::InputAssumptions::kPlainPrimitive:
+      return os << "PlainPrimitive";
+  }
+}
+
+std::ostream& operator<<(
+    std::ostream& os,
+    ConvertJSPrimitiveToUntaggedOrDeoptOp::UntaggedKind kind) {
+  switch (kind) {
+    case ConvertJSPrimitiveToUntaggedOrDeoptOp::UntaggedKind::kInt32:
+      return os << "Int32";
+    case ConvertJSPrimitiveToUntaggedOrDeoptOp::UntaggedKind::kInt64:
+      return os << "Int64";
+    case ConvertJSPrimitiveToUntaggedOrDeoptOp::UntaggedKind::kFloat64:
+      return os << "Float64";
+    case ConvertJSPrimitiveToUntaggedOrDeoptOp::UntaggedKind::kArrayIndex:
+      return os << "ArrayIndex";
+  }
+}
+
+std::ostream& operator<<(
+    std::ostream& os,
+    ConvertJSPrimitiveToUntaggedOrDeoptOp::JSPrimitiveKind kind) {
+  switch (kind) {
+    case ConvertJSPrimitiveToUntaggedOrDeoptOp::JSPrimitiveKind::kNumber:
+      return os << "Number";
+    case ConvertJSPrimitiveToUntaggedOrDeoptOp::JSPrimitiveKind::
+        kNumberOrBoolean:
+      return os << "NumberOrBoolean";
+    case ConvertJSPrimitiveToUntaggedOrDeoptOp::JSPrimitiveKind::
+        kNumberOrOddball:
+      return os << "NumberOrOddball";
+    case ConvertJSPrimitiveToUntaggedOrDeoptOp::JSPrimitiveKind::
+        kNumberOrString:
+      return os << "NumberOrString";
+    case ConvertJSPrimitiveToUntaggedOrDeoptOp::JSPrimitiveKind::kSmi:
+      return os << "Smi";
+  }
+}
+
+std::ostream& operator<<(std::ostream& os,
+                         TruncateJSPrimitiveToUntaggedOp::UntaggedKind kind) {
+  switch (kind) {
+    case TruncateJSPrimitiveToUntaggedOp::UntaggedKind::kInt32:
+      return os << "Int32";
+    case TruncateJSPrimitiveToUntaggedOp::UntaggedKind::kInt64:
+      return os << "Int64";
+    case TruncateJSPrimitiveToUntaggedOp::UntaggedKind::kBit:
       return os << "Bit";
   }
 }
 
 std::ostream& operator<<(
     std::ostream& os,
-    ConvertObjectToPrimitiveOp::InputAssumptions input_assumptions) {
+    TruncateJSPrimitiveToUntaggedOp::InputAssumptions input_assumptions) {
   switch (input_assumptions) {
-    case ConvertObjectToPrimitiveOp::InputAssumptions::kObject:
-      return os << "Object";
-    case ConvertObjectToPrimitiveOp::InputAssumptions::kSmi:
-      return os << "Smi";
-    case ConvertObjectToPrimitiveOp::InputAssumptions::kNumberOrOddball:
+    case TruncateJSPrimitiveToUntaggedOp::InputAssumptions::kBigInt:
+      return os << "BigInt";
+    case TruncateJSPrimitiveToUntaggedOp::InputAssumptions::kNumberOrOddball:
       return os << "NumberOrOddball";
+    case TruncateJSPrimitiveToUntaggedOp::InputAssumptions::kHeapObject:
+      return os << "HeapObject";
+    case TruncateJSPrimitiveToUntaggedOp::InputAssumptions::kObject:
+      return os << "Object";
   }
 }
 
 std::ostream& operator<<(
-    std::ostream& os, ConvertObjectToPrimitiveOrDeoptOp::PrimitiveKind kind) {
+    std::ostream& os,
+    TruncateJSPrimitiveToUntaggedOrDeoptOp::UntaggedKind kind) {
   switch (kind) {
-    case ConvertObjectToPrimitiveOrDeoptOp::PrimitiveKind::kInt32:
+    case TruncateJSPrimitiveToUntaggedOrDeoptOp::UntaggedKind::kInt32:
       return os << "Int32";
-    case ConvertObjectToPrimitiveOrDeoptOp::PrimitiveKind::kInt64:
-      return os << "Int64";
-    case ConvertObjectToPrimitiveOrDeoptOp::PrimitiveKind::kFloat64:
-      return os << "Float64";
-    case ConvertObjectToPrimitiveOrDeoptOp::PrimitiveKind::kArrayIndex:
-      return os << "ArrayIndex";
-  }
-}
-
-std::ostream& operator<<(std::ostream& os,
-                         ConvertObjectToPrimitiveOrDeoptOp::ObjectKind kind) {
-  switch (kind) {
-    case ConvertObjectToPrimitiveOrDeoptOp::ObjectKind::kNumber:
-      return os << "Number";
-    case ConvertObjectToPrimitiveOrDeoptOp::ObjectKind::kNumberOrBoolean:
-      return os << "NumberOrBoolean";
-    case ConvertObjectToPrimitiveOrDeoptOp::ObjectKind::kNumberOrOddball:
-      return os << "NumberOrOddball";
-    case ConvertObjectToPrimitiveOrDeoptOp::ObjectKind::kNumberOrString:
-      return os << "NumberOrString";
-    case ConvertObjectToPrimitiveOrDeoptOp::ObjectKind::kSmi:
-      return os << "Smi";
   }
 }
 
@@ -928,6 +1123,119 @@ std::ostream& operator<<(std::ostream& os, BigIntUnaryOp::Kind kind) {
   }
 }
 
+std::ostream& operator<<(std::ostream& os, StringAtOp::Kind kind) {
+  switch (kind) {
+    case StringAtOp::Kind::kCharCode:
+      return os << "CharCode";
+    case StringAtOp::Kind::kCodePoint:
+      return os << "CodePoint";
+  }
+}
+
+#ifdef V8_INTL_SUPPORT
+std::ostream& operator<<(std::ostream& os, StringToCaseIntlOp::Kind kind) {
+  switch (kind) {
+    case StringToCaseIntlOp::Kind::kLower:
+      return os << "Lower";
+    case StringToCaseIntlOp::Kind::kUpper:
+      return os << "Upper";
+  }
+}
+#endif  // V8_INTL_SUPPORT
+
+std::ostream& operator<<(std::ostream& os, StringComparisonOp::Kind kind) {
+  switch (kind) {
+    case StringComparisonOp::Kind::kLessThan:
+      return os << "LessThan";
+    case StringComparisonOp::Kind::kLessThanOrEqual:
+      return os << "LessThanOrEqual";
+  }
+}
+
+std::ostream& operator<<(std::ostream& os, ArgumentsLengthOp::Kind kind) {
+  switch (kind) {
+    case ArgumentsLengthOp::Kind::kArguments:
+      return os << "Arguments";
+    case ArgumentsLengthOp::Kind::kRest:
+      return os << "Rest";
+  }
+}
+
+std::ostream& operator<<(std::ostream& os,
+                         TransitionAndStoreArrayElementOp::Kind kind) {
+  switch (kind) {
+    case TransitionAndStoreArrayElementOp::Kind::kElement:
+      return os << "Element";
+    case TransitionAndStoreArrayElementOp::Kind::kNumberElement:
+      return os << "NumberElement";
+    case TransitionAndStoreArrayElementOp::Kind::kOddballElement:
+      return os << "OddballElement";
+    case TransitionAndStoreArrayElementOp::Kind::kNonNumberElement:
+      return os << "NonNumberElement";
+    case TransitionAndStoreArrayElementOp::Kind::kSignedSmallElement:
+      return os << "SignedSmallElement";
+  }
+}
+
+std::ostream& operator<<(std::ostream& os, SameValueOp::Mode mode) {
+  switch (mode) {
+    case SameValueOp::Mode::kSameValue:
+      return os << "SameValue";
+    case SameValueOp::Mode::kSameValueNumbersOnly:
+      return os << "SameValueNumbersOnly";
+  }
+}
+
+std::ostream& operator<<(std::ostream& os, FindOrderedHashEntryOp::Kind kind) {
+  switch (kind) {
+    case FindOrderedHashEntryOp::Kind::kFindOrderedHashMapEntry:
+      return os << "FindOrderedHashMapEntry";
+    case FindOrderedHashEntryOp::Kind::kFindOrderedHashMapEntryForInt32Key:
+      return os << "FindOrderedHashMapEntryForInt32Key";
+    case FindOrderedHashEntryOp::Kind::kFindOrderedHashSetEntry:
+      return os << "FindOrderedHashSetEntry";
+  }
+}
+
+#if V8_ENABLE_WEBASSEMBLY
+
+const RegisterRepresentation& RepresentationFor(wasm::ValueType type) {
+  static const RegisterRepresentation kWord32 =
+      RegisterRepresentation::Word32();
+  static const RegisterRepresentation kWord64 =
+      RegisterRepresentation::Word64();
+  static const RegisterRepresentation kFloat32 =
+      RegisterRepresentation::Float32();
+  static const RegisterRepresentation kFloat64 =
+      RegisterRepresentation::Float64();
+  static const RegisterRepresentation kTagged =
+      RegisterRepresentation::Tagged();
+
+  switch (type.kind()) {
+    case wasm::kI8:
+    case wasm::kI16:
+    case wasm::kI32:
+      return kWord32;
+    case wasm::kI64:
+      return kWord64;
+    case wasm::kF32:
+      return kFloat32;
+    case wasm::kF64:
+      return kFloat64;
+    case wasm::kRefNull:
+    case wasm::kRef:
+      return kTagged;
+    case wasm::kS128:
+      UNIMPLEMENTED();
+    case wasm::kVoid:
+    case wasm::kRtt:
+    case wasm::kBottom:
+      UNREACHABLE();
+  }
+}
+
+#endif  // V8_ENABLE_WEBASSEBMLY
+
 std::string Operation::ToString() const {
   std::stringstream ss;
   ss << *this;
@@ -950,6 +1258,18 @@ void SupportedOperations::Initialize() {
 
   SUPPORTED_OPERATIONS_LIST(SET_SUPPORTED)
 #undef SET_SUPPORTED
+}
+
+// static
+bool SupportedOperations::IsUnalignedLoadSupported(MemoryRepresentation repr) {
+  return InstructionSelector::AlignmentRequirements().IsUnalignedLoadSupported(
+      repr.ToMachineType().representation());
+}
+
+// static
+bool SupportedOperations::IsUnalignedStoreSupported(MemoryRepresentation repr) {
+  return InstructionSelector::AlignmentRequirements().IsUnalignedStoreSupported(
+      repr.ToMachineType().representation());
 }
 
 }  // namespace v8::internal::compiler::turboshaft

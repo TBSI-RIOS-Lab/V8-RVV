@@ -7,6 +7,7 @@
 #include <iomanip>
 
 #include "src/base/memory.h"
+#include "src/base/v8-fallthrough.h"
 #include "src/common/assert-scope.h"
 #include "src/deoptimizer/deoptimizer.h"
 #include "src/deoptimizer/materialized-object-store.h"
@@ -82,13 +83,37 @@ void TranslationArrayPrintSingleFrame(
         break;
       }
 
-      case TranslationOpcode::CONSTRUCT_STUB_FRAME: {
+#if V8_ENABLE_WEBASSEMBLY
+      case TranslationOpcode::WASM_INLINED_INTO_JS_FRAME: {
         DCHECK_EQ(TranslationOpcodeOperandCount(opcode), 3);
         int bailout_id = iterator.NextOperand();
         int shared_info_id = iterator.NextOperand();
         Object shared_info = literal_array.get(shared_info_id);
         unsigned height = iterator.NextOperand();
         os << "{bailout_id=" << bailout_id << ", function="
+           << SharedFunctionInfo::cast(shared_info).DebugNameCStr().get()
+           << ", height=" << height << "}";
+        break;
+      }
+
+#endif
+      case TranslationOpcode::CONSTRUCT_CREATE_STUB_FRAME: {
+        DCHECK_EQ(TranslationOpcodeOperandCount(opcode), 2);
+        int shared_info_id = iterator.NextOperand();
+        Object shared_info = literal_array.get(shared_info_id);
+        unsigned height = iterator.NextOperand();
+        os << "{construct create stub, function="
+           << SharedFunctionInfo::cast(shared_info).DebugNameCStr().get()
+           << ", height=" << height << "}";
+        break;
+      }
+
+      case TranslationOpcode::CONSTRUCT_INVOKE_STUB_FRAME: {
+        DCHECK_EQ(TranslationOpcodeOperandCount(opcode), 2);
+        int shared_info_id = iterator.NextOperand();
+        Object shared_info = literal_array.get(shared_info_id);
+        unsigned height = iterator.NextOperand();
+        os << "{construct invoke stub, function="
            << SharedFunctionInfo::cast(shared_info).DebugNameCStr().get()
            << ", height=" << height << "}";
         break;
@@ -202,7 +227,14 @@ void TranslationArrayPrintSingleFrame(
         break;
       }
 
-      case TranslationOpcode::STACK_SLOT: {
+      case TranslationOpcode::HOLEY_DOUBLE_REGISTER: {
+        DCHECK_EQ(TranslationOpcodeOperandCount(opcode), 1);
+        int reg_code = iterator.NextOperandUnsigned();
+        os << "{input=" << DoubleRegister::from_code(reg_code) << " (holey)}";
+        break;
+      }
+
+      case TranslationOpcode::TAGGED_STACK_SLOT: {
         DCHECK_EQ(TranslationOpcodeOperandCount(opcode), 1);
         int input_slot_index = iterator.NextOperand();
         os << "{input=" << input_slot_index << "}";
@@ -256,6 +288,13 @@ void TranslationArrayPrintSingleFrame(
         DCHECK_EQ(TranslationOpcodeOperandCount(opcode), 1);
         int input_slot_index = iterator.NextOperand();
         os << "{input=" << input_slot_index << "}";
+        break;
+      }
+
+      case TranslationOpcode::HOLEY_DOUBLE_STACK_SLOT: {
+        DCHECK_EQ(TranslationOpcodeOperandCount(opcode), 1);
+        int input_slot_index = iterator.NextOperand();
+        os << "{input=" << input_slot_index << " (holey)}";
         break;
       }
 
@@ -343,6 +382,14 @@ TranslatedValue TranslatedValue::NewFloat(TranslatedState* container,
 TranslatedValue TranslatedValue::NewDouble(TranslatedState* container,
                                            Float64 value) {
   TranslatedValue slot(container, kDouble);
+  slot.double_value_ = value;
+  return slot;
+}
+
+// static
+TranslatedValue TranslatedValue::NewHoleyDouble(TranslatedState* container,
+                                                Float64 value) {
+  TranslatedValue slot(container, kHoleyDouble);
   slot.double_value_ = value;
   return slot;
 }
@@ -441,7 +488,7 @@ Float32 TranslatedValue::float_value() const {
 }
 
 Float64 TranslatedValue::double_value() const {
-  DCHECK_EQ(kDouble, kind());
+  DCHECK(kDouble == kind() || kHoleyDouble == kind());
   return double_value_;
 }
 
@@ -564,6 +611,15 @@ Object TranslatedValue::GetRawValue() const {
       break;
     }
 
+    case kHoleyDouble:
+      if (double_value().is_hole_nan()) {
+        // Hole NaNs that made it to here represent the undefined value.
+        return ReadOnlyRoots(isolate()).undefined_value();
+      }
+      // If this is not the hole nan, then this is a normal double value, so
+      // fall through to that.
+      V8_FALLTHROUGH;
+
     case kDouble: {
       int smi;
       if (DoubleToSmiInteger(double_value().get_scalar(), &smi)) {
@@ -621,13 +677,6 @@ Handle<Object> TranslatedValue::GetValue() {
     //    pass the verifier.
     container_->EnsureObjectAllocatedAt(this);
 
-    // Finish any sweeping so that it becomes safe to overwrite the ByteArray
-    // headers.
-    // TODO(hpayer): Find a cleaner way to support a group of
-    // non-fully-initialized objects.
-    isolate()->heap()->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kV8Only);
-
     // 2. Initialize the objects. If we have allocated only byte arrays
     //    for some objects, we now overwrite the byte arrays with the
     //    correct object fields. Note that this phase does not allocate
@@ -661,6 +710,9 @@ Handle<Object> TranslatedValue::GetValue() {
       heap_object = isolate()->factory()->NewHeapNumber(number);
       break;
     case TranslatedValue::kDouble:
+    // We shouldn't have hole values by now, so treat holey double as normal
+    // double.s
+    case TranslatedValue::kHoleyDouble:
       number = double_value().get_scalar();
       heap_object = isolate()->factory()->NewHeapNumber(number);
       break;
@@ -685,7 +737,7 @@ bool TranslatedValue::IsMaterializedObject() const {
 
 bool TranslatedValue::IsMaterializableByDebugger() const {
   // At the moment, we only allow materialization of doubles.
-  return (kind() == kDouble);
+  return (kind() == kDouble || kind() == kHoleyDouble);
 }
 
 int TranslatedValue::GetChildrenCount() const {
@@ -747,12 +799,14 @@ TranslatedFrame TranslatedFrame::InlinedExtraArguments(
   return TranslatedFrame(kInlinedExtraArguments, shared_info, height);
 }
 
-TranslatedFrame TranslatedFrame::ConstructStubFrame(
-    BytecodeOffset bytecode_offset, SharedFunctionInfo shared_info,
-    int height) {
-  TranslatedFrame frame(kConstructStub, shared_info, height);
-  frame.bytecode_offset_ = bytecode_offset;
-  return frame;
+TranslatedFrame TranslatedFrame::ConstructCreateStubFrame(
+    SharedFunctionInfo shared_info, int height) {
+  return TranslatedFrame(kConstructCreateStub, shared_info, height);
+}
+
+TranslatedFrame TranslatedFrame::ConstructInvokeStubFrame(
+    SharedFunctionInfo shared_info, int height) {
+  return TranslatedFrame(kConstructInvokeStub, shared_info, height);
 }
 
 TranslatedFrame TranslatedFrame::BuiltinContinuationFrame(
@@ -764,6 +818,14 @@ TranslatedFrame TranslatedFrame::BuiltinContinuationFrame(
 }
 
 #if V8_ENABLE_WEBASSEMBLY
+TranslatedFrame TranslatedFrame::WasmInlinedIntoJSFrame(
+    BytecodeOffset bytecode_offset, SharedFunctionInfo shared_info,
+    int height) {
+  TranslatedFrame frame(kWasmInlinedIntoJS, shared_info, height);
+  frame.bytecode_offset_ = bytecode_offset;
+  return frame;
+}
+
 TranslatedFrame TranslatedFrame::JSToWasmBuiltinContinuationFrame(
     BytecodeOffset bytecode_offset, SharedFunctionInfo shared_info, int height,
     base::Optional<wasm::ValueKind> return_kind) {
@@ -809,7 +871,8 @@ int TranslatedFrame::GetValueCount() {
     case kInlinedExtraArguments:
       return height() + kTheFunction;
 
-    case kConstructStub:
+    case kConstructCreateStub:
+    case kConstructInvokeStub:
     case kBuiltinContinuation:
 #if V8_ENABLE_WEBASSEMBLY
     case kJSToWasmBuiltinContinuation:
@@ -819,6 +882,12 @@ int TranslatedFrame::GetValueCount() {
       static constexpr int kTheContext = 1;
       return height() + kTheContext + kTheFunction;
     }
+#if V8_ENABLE_WEBASSEMBLY
+    case kWasmInlinedIntoJS: {
+      static constexpr int kTheContext = 1;
+      return height() + kTheContext + kTheFunction;
+    }
+#endif  // V8_ENABLE_WEBASSEMBLY
 
     case kInvalid:
       UNREACHABLE();
@@ -826,10 +895,9 @@ int TranslatedFrame::GetValueCount() {
   UNREACHABLE();
 }
 
-void TranslatedFrame::Handlify() {
+void TranslatedFrame::Handlify(Isolate* isolate) {
   if (!raw_shared_info_.is_null()) {
-    shared_info_ = Handle<SharedFunctionInfo>(raw_shared_info_,
-                                              raw_shared_info_.GetIsolate());
+    shared_info_ = handle(raw_shared_info_, isolate);
     raw_shared_info_ = SharedFunctionInfo();
   }
   for (auto& value : values_) {
@@ -882,19 +950,32 @@ TranslatedFrame TranslatedState::CreateNextTranslatedFrame(
       return TranslatedFrame::InlinedExtraArguments(shared_info, height);
     }
 
-    case TranslationOpcode::CONSTRUCT_STUB_FRAME: {
-      BytecodeOffset bytecode_offset = BytecodeOffset(iterator->NextOperand());
+    case TranslationOpcode::CONSTRUCT_CREATE_STUB_FRAME: {
       SharedFunctionInfo shared_info =
           SharedFunctionInfo::cast(literal_array.get(iterator->NextOperand()));
       int height = iterator->NextOperand();
       if (trace_file != nullptr) {
         std::unique_ptr<char[]> name = shared_info.DebugNameCStr();
-        PrintF(trace_file, "  reading construct stub frame %s", name.get());
-        PrintF(trace_file, " => bytecode_offset=%d, height=%d; inputs:\n",
-               bytecode_offset.ToInt(), height);
+        PrintF(trace_file,
+               "  reading construct create stub frame %s => height = %d; "
+               "inputs:\n",
+               name.get(), height);
       }
-      return TranslatedFrame::ConstructStubFrame(bytecode_offset, shared_info,
-                                                 height);
+      return TranslatedFrame::ConstructCreateStubFrame(shared_info, height);
+    }
+
+    case TranslationOpcode::CONSTRUCT_INVOKE_STUB_FRAME: {
+      SharedFunctionInfo shared_info =
+          SharedFunctionInfo::cast(literal_array.get(iterator->NextOperand()));
+      int height = iterator->NextOperand();
+      if (trace_file != nullptr) {
+        std::unique_ptr<char[]> name = shared_info.DebugNameCStr();
+        PrintF(trace_file,
+               "  reading construct invoke stub frame %s => height = %d; "
+               "inputs:\n",
+               name.get(), height);
+      }
+      return TranslatedFrame::ConstructInvokeStubFrame(shared_info, height);
     }
 
     case TranslationOpcode::BUILTIN_CONTINUATION_FRAME: {
@@ -914,6 +995,22 @@ TranslatedFrame TranslatedState::CreateNextTranslatedFrame(
     }
 
 #if V8_ENABLE_WEBASSEMBLY
+    case TranslationOpcode::WASM_INLINED_INTO_JS_FRAME: {
+      BytecodeOffset bailout_id = BytecodeOffset(iterator->NextOperand());
+      SharedFunctionInfo shared_info =
+          SharedFunctionInfo::cast(literal_array.get(iterator->NextOperand()));
+      int height = iterator->NextOperand();
+      if (trace_file != nullptr) {
+        std::unique_ptr<char[]> name = shared_info.DebugNameCStr();
+        PrintF(trace_file, "  reading Wasm inlined into JS frame %s",
+               name.get());
+        PrintF(trace_file, " => bailout_id=%d, height=%d ; inputs:\n",
+               bailout_id.ToInt(), height);
+      }
+      return TranslatedFrame::WasmInlinedIntoJSFrame(bailout_id, shared_info,
+                                                     height);
+    }
+
     case TranslationOpcode::JS_TO_WASM_BUILTIN_CONTINUATION_FRAME: {
       BytecodeOffset bailout_id = BytecodeOffset(iterator->NextOperand());
       SharedFunctionInfo shared_info =
@@ -986,7 +1083,8 @@ TranslatedFrame TranslatedState::CreateNextTranslatedFrame(
     case TranslationOpcode::BOOL_REGISTER:
     case TranslationOpcode::FLOAT_REGISTER:
     case TranslationOpcode::DOUBLE_REGISTER:
-    case TranslationOpcode::STACK_SLOT:
+    case TranslationOpcode::HOLEY_DOUBLE_REGISTER:
+    case TranslationOpcode::TAGGED_STACK_SLOT:
     case TranslationOpcode::INT32_STACK_SLOT:
     case TranslationOpcode::INT64_STACK_SLOT:
     case TranslationOpcode::SIGNED_BIGINT64_STACK_SLOT:
@@ -995,6 +1093,7 @@ TranslatedFrame TranslatedState::CreateNextTranslatedFrame(
     case TranslationOpcode::BOOL_STACK_SLOT:
     case TranslationOpcode::FLOAT_STACK_SLOT:
     case TranslationOpcode::DOUBLE_STACK_SLOT:
+    case TranslationOpcode::HOLEY_DOUBLE_STACK_SLOT:
     case TranslationOpcode::LITERAL:
     case TranslationOpcode::OPTIMIZED_OUT:
     case TranslationOpcode::MATCH_PREVIOUS_TRANSLATION:
@@ -1098,11 +1197,13 @@ int TranslatedState::CreateNextTranslatedValue(
     case TranslationOpcode::INTERPRETED_FRAME_WITH_RETURN:
     case TranslationOpcode::INTERPRETED_FRAME_WITHOUT_RETURN:
     case TranslationOpcode::INLINED_EXTRA_ARGUMENTS:
-    case TranslationOpcode::CONSTRUCT_STUB_FRAME:
+    case TranslationOpcode::CONSTRUCT_CREATE_STUB_FRAME:
+    case TranslationOpcode::CONSTRUCT_INVOKE_STUB_FRAME:
     case TranslationOpcode::JAVA_SCRIPT_BUILTIN_CONTINUATION_FRAME:
     case TranslationOpcode::JAVA_SCRIPT_BUILTIN_CONTINUATION_WITH_CATCH_FRAME:
     case TranslationOpcode::BUILTIN_CONTINUATION_FRAME:
 #if V8_ENABLE_WEBASSEMBLY
+    case TranslationOpcode::WASM_INLINED_INTO_JS_FRAME:
     case TranslationOpcode::JS_TO_WASM_BUILTIN_CONTINUATION_FRAME:
 #endif  // V8_ENABLE_WEBASSEMBLY
     case TranslationOpcode::UPDATE_FEEDBACK:
@@ -1316,7 +1417,30 @@ int TranslatedState::CreateNextTranslatedValue(
       return translated_value.GetChildrenCount();
     }
 
-    case TranslationOpcode::STACK_SLOT: {
+    case TranslationOpcode::HOLEY_DOUBLE_REGISTER: {
+      int input_reg = iterator->NextOperandUnsigned();
+      if (registers == nullptr) {
+        TranslatedValue translated_value = TranslatedValue::NewInvalid(this);
+        frame.Add(translated_value);
+        return translated_value.GetChildrenCount();
+      }
+      Float64 value = registers->GetDoubleRegister(input_reg);
+      if (trace_file != nullptr) {
+        if (value.is_hole_nan()) {
+          PrintF(trace_file, "the hole");
+        } else {
+          PrintF(trace_file, "%e", value.get_scalar());
+        }
+        PrintF(trace_file, " ; %s (holey double)",
+               RegisterName(DoubleRegister::from_code(input_reg)));
+      }
+      TranslatedValue translated_value =
+          TranslatedValue::NewHoleyDouble(this, value);
+      frame.Add(translated_value);
+      return translated_value.GetChildrenCount();
+    }
+
+    case TranslationOpcode::TAGGED_STACK_SLOT: {
       int slot_offset =
           OptimizedFrame::StackSlotOffsetRelativeToFp(iterator->NextOperand());
       intptr_t value = *(reinterpret_cast<intptr_t*>(fp + slot_offset));
@@ -1441,6 +1565,25 @@ int TranslatedState::CreateNextTranslatedValue(
       }
       TranslatedValue translated_value =
           TranslatedValue::NewDouble(this, value);
+      frame.Add(translated_value);
+      return translated_value.GetChildrenCount();
+    }
+
+    case TranslationOpcode::HOLEY_DOUBLE_STACK_SLOT: {
+      int slot_offset =
+          OptimizedFrame::StackSlotOffsetRelativeToFp(iterator->NextOperand());
+      Float64 value = GetDoubleSlot(fp, slot_offset);
+      if (trace_file != nullptr) {
+        if (value.is_hole_nan()) {
+          PrintF(trace_file, "the hole");
+        } else {
+          PrintF(trace_file, "%e", value.get_scalar());
+        }
+        PrintF(trace_file, " ; (holey double) [fp %c %d] ",
+               slot_offset < 0 ? '-' : '+', std::abs(slot_offset));
+      }
+      TranslatedValue translated_value =
+          TranslatedValue::NewHoleyDouble(this, value);
       frame.Add(translated_value);
       return translated_value.GetChildrenCount();
     }
@@ -1581,11 +1724,12 @@ void TranslatedState::Init(Isolate* isolate, Address input_frame_pointer,
 }
 
 void TranslatedState::Prepare(Address stack_frame_pointer) {
-  for (auto& frame : frames_) frame.Handlify();
+  for (auto& frame : frames_) {
+    frame.Handlify(isolate());
+  }
 
   if (!feedback_vector_.is_null()) {
-    feedback_vector_handle_ =
-        Handle<FeedbackVector>(feedback_vector_, isolate());
+    feedback_vector_handle_ = handle(feedback_vector_, isolate());
     feedback_vector_ = FeedbackVector();
   }
   stack_frame_pointer_ = stack_frame_pointer;
@@ -1757,10 +1901,7 @@ void TranslatedState::MaterializeHeapNumber(TranslatedFrame* frame,
 
 namespace {
 
-enum StorageKind : uint8_t {
-  kStoreTagged,
-  kStoreHeapObject
-};
+enum StorageKind : uint8_t { kStoreTagged, kStoreHeapObject };
 
 }  // namespace
 
@@ -1835,7 +1976,7 @@ void TranslatedState::EnsureCapturedObjectAllocatedAt(
       CHECK_EQ(instance_size, slot->GetChildrenCount() * kTaggedSize);
 
       // Canonicalize empty fixed array.
-      if (*map == ReadOnlyRoots(isolate()).empty_fixed_array().map() &&
+      if (*map == ReadOnlyRoots(isolate()).empty_fixed_array()->map() &&
           array_length == 0) {
         slot->set_storage(isolate()->factory()->empty_fixed_array());
       } else {
@@ -1967,8 +2108,8 @@ void TranslatedState::EnsurePropertiesAllocatedAndMarked(
   properties_slot->set_storage(object_storage);
 
   DisallowGarbageCollection no_gc;
-  auto raw_map = *map;
-  auto raw_object_storage = *object_storage;
+  Tagged<Map> raw_map = *map;
+  Tagged<ByteArray> raw_object_storage = *object_storage;
 
   // Set markers for out-of-object properties.
   DescriptorArray descriptors = map->instance_descriptors(isolate());
@@ -1979,7 +2120,7 @@ void TranslatedState::EnsurePropertiesAllocatedAndMarked(
         (representation.IsDouble() || representation.IsHeapObject())) {
       int outobject_index = index.outobject_array_index();
       int array_index = outobject_index * kTaggedSize;
-      raw_object_storage.set(array_index, kStoreHeapObject);
+      raw_object_storage->set(array_index, kStoreHeapObject);
     }
   }
 }
@@ -1992,9 +2133,9 @@ Handle<ByteArray> TranslatedState::AllocateStorageFor(TranslatedValue* slot) {
   Handle<ByteArray> object_storage =
       isolate()->factory()->NewByteArray(allocate_size, AllocationType::kOld);
   DisallowGarbageCollection no_gc;
-  auto raw_object_storage = *object_storage;
+  Tagged<ByteArray> raw_object_storage = *object_storage;
   for (int i = 0; i < object_storage->length(); i++) {
-    raw_object_storage.set(i, kStoreTagged);
+    raw_object_storage->set(i, kStoreTagged);
   }
   return object_storage;
 }
@@ -2008,19 +2149,19 @@ void TranslatedState::EnsureJSObjectAllocated(TranslatedValue* slot,
 
   // Now we handle the interesting (JSObject) case.
   DisallowGarbageCollection no_gc;
-  auto raw_map = *map;
-  auto raw_object_storage = *object_storage;
+  Tagged<Map> raw_map = *map;
+  Tagged<ByteArray> raw_object_storage = *object_storage;
   DescriptorArray descriptors = map->instance_descriptors(isolate());
 
   // Set markers for in-object properties.
-  for (InternalIndex i : raw_map.IterateOwnDescriptors()) {
+  for (InternalIndex i : raw_map->IterateOwnDescriptors()) {
     FieldIndex index = FieldIndex::ForDescriptor(raw_map, i);
     Representation representation = descriptors.GetDetails(i).representation();
     if (index.is_inobject() &&
         (representation.IsDouble() || representation.IsHeapObject())) {
       CHECK_GE(index.index(), FixedArray::kHeaderSize / kTaggedSize);
       int array_index = index.index() * kTaggedSize - FixedArray::kHeaderSize;
-      raw_object_storage.set(array_index, kStoreHeapObject);
+      raw_object_storage->set(array_index, kStoreHeapObject);
     }
   }
   slot->set_storage(object_storage);
@@ -2072,6 +2213,10 @@ void TranslatedState::InitializeJSObjectAt(
   // Notify the concurrent marker about the layout change.
   isolate()->heap()->NotifyObjectLayoutChange(*object_storage, no_gc,
                                               InvalidateRecordedSlots::kNo);
+
+  // Finish any sweeping so that it becomes safe to overwrite the ByteArray
+  // headers. See chromium:1228036.
+  isolate()->heap()->EnsureSweepingCompletedForObject(*object_storage);
 
   // Fill the property array field.
   {
@@ -2134,6 +2279,10 @@ void TranslatedState::InitializeObjectWithTaggedFieldsAt(
   // Notify the concurrent marker about the layout change.
   isolate()->heap()->NotifyObjectLayoutChange(*object_storage, no_gc,
                                               InvalidateRecordedSlots::kNo);
+
+  // Finish any sweeping so that it becomes safe to overwrite the ByteArray
+  // headers. See chromium:1228036.
+  isolate()->heap()->EnsureSweepingCompletedForObject(*object_storage);
 
   // Write the fields to the object.
   for (int i = 1; i < children_count; i++) {

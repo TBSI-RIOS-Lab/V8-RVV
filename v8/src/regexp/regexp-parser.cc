@@ -4,7 +4,6 @@
 
 #include "src/regexp/regexp-parser.h"
 
-#include "src/base/small-vector.h"
 #include "src/execution/isolate.h"
 #include "src/objects/string-inl.h"
 #include "src/regexp/regexp-ast.h"
@@ -47,15 +46,11 @@ enum class ClassSetOperandType {
 
 class RegExpTextBuilder {
  public:
-  using SmallRegExpTreeVector =
-      base::SmallVector<RegExpTree*, 8, ZoneAllocator<RegExpTree*>>;
+  using SmallRegExpTreeVector = SmallZoneVector<RegExpTree*, 8>;
 
   RegExpTextBuilder(Zone* zone, SmallRegExpTreeVector* terms_storage,
                     RegExpFlags flags)
-      : zone_(zone),
-        flags_(flags),
-        terms_(terms_storage),
-        text_(ZoneAllocator<RegExpTree*>{zone}) {}
+      : zone_(zone), flags_(flags), terms_(terms_storage), text_(zone) {}
   void AddCharacter(base::uc16 character);
   void AddUnicodeCharacter(base::uc32 character);
   void AddEscapedUnicodeCharacter(base::uc32 character);
@@ -299,8 +294,8 @@ class RegExpBuilder {
   RegExpBuilder(Zone* zone, RegExpFlags flags)
       : zone_(zone),
         flags_(flags),
-        terms_(ZoneAllocator<RegExpTree*>{zone}),
-        alternatives_(ZoneAllocator<RegExpTree*>{zone}),
+        terms_(zone),
+        alternatives_(zone),
         text_builder_(RegExpTextBuilder{zone, &terms_, flags}) {}
   void AddCharacter(base::uc16 character);
   void AddUnicodeCharacter(base::uc32 character);
@@ -338,8 +333,7 @@ class RegExpBuilder {
   bool pending_empty_ = false;
   const RegExpFlags flags_;
 
-  using SmallRegExpTreeVector =
-      base::SmallVector<RegExpTree*, 8, ZoneAllocator<RegExpTree*>>;
+  using SmallRegExpTreeVector = SmallZoneVector<RegExpTree*, 8>;
   SmallRegExpTreeVector terms_;
   SmallRegExpTreeVector alternatives_;
   RegExpTextBuilder text_builder_;
@@ -429,8 +423,8 @@ class RegExpParserState : public ZoneObject {
 template <class CharT>
 class RegExpParserImpl final {
  private:
-  RegExpParserImpl(Isolate* isolate, const CharT* input, int input_length,
-                   RegExpFlags flags, uintptr_t stack_limit, Zone* zone,
+  RegExpParserImpl(const CharT* input, int input_length, RegExpFlags flags,
+                   uintptr_t stack_limit, Zone* zone,
                    const DisallowGarbageCollection& no_gc);
 
   bool Parse(RegExpCompileData* result);
@@ -563,7 +557,6 @@ class RegExpParserImpl final {
   bool HasNamedCaptures(InClassEscapeState in_class_escape_state);
 
   Zone* zone() const { return zone_; }
-  Isolate* isolate() const { return isolate_; }
 
   base::uc32 current() const { return current_; }
   bool has_more() const { return has_more_; }
@@ -604,10 +597,6 @@ class RegExpParserImpl final {
 
   const DisallowGarbageCollection no_gc_;
   Zone* const zone_;
-  // TODO(pthier, v8:11935): Isolate is only used to increment the UseCounter
-  // for unicode set incompabilities in unicode mode. Remove when the counter
-  // is removed.
-  Isolate* const isolate_;
   RegExpError error_ = RegExpError::kNone;
   int error_pos_ = 0;
   ZoneList<RegExpCapture*>* captures_;
@@ -634,10 +623,9 @@ class RegExpParserImpl final {
 
 template <class CharT>
 RegExpParserImpl<CharT>::RegExpParserImpl(
-    Isolate* isolate, const CharT* input, int input_length, RegExpFlags flags,
+    const CharT* input, int input_length, RegExpFlags flags,
     uintptr_t stack_limit, Zone* zone, const DisallowGarbageCollection& no_gc)
     : zone_(zone),
-      isolate_(isolate),
       captures_(nullptr),
       named_captures_(nullptr),
       named_back_references_(nullptr),
@@ -1852,8 +1840,7 @@ void ExtractStringsFromUnicodeSet(const icu::UnicodeSet& set,
   DCHECK(IsUnicodeSets(flags));
   DCHECK_NOT_NULL(strings);
 
-  RegExpTextBuilder::SmallRegExpTreeVector string_storage(
-      ZoneAllocator<RegExpTree*>{zone});
+  RegExpTextBuilder::SmallRegExpTreeVector string_storage(zone);
   RegExpTextBuilder string_builder(zone, &string_storage, flags);
   const bool needs_case_folding = IsIgnoreCase(flags);
   icu::UnicodeSetIterator iter(set);
@@ -1910,7 +1897,7 @@ bool LookupPropertyValueName(UProperty property,
       ExtractStringsFromUnicodeSet(set, result_strings, flags, zone);
     }
     const bool needs_case_folding = IsUnicodeSets(flags) && IsIgnoreCase(flags);
-    if (needs_case_folding) CharacterRange::UnicodeSimpleCloseOver(set);
+    if (needs_case_folding) set.closeOver(USET_SIMPLE_CASE_INSENSITIVE);
     set.removeAllStrings();
     if (negate) set.complement();
     for (int i = 0; i < set.getRangeCount(); i++) {
@@ -2403,21 +2390,6 @@ void RegExpParserImpl<CharT>::ParseClassEscape(
   if (current() != '\\') {
     // Not a ClassEscape.
     *char_out = current();
-    // Count usages of patterns that would break when replacing /u with /v.
-    // This is only temporarily enabled and should give us an idea if it is
-    // feasible to enable unicode sets for usage in the pattern attribute.
-    // TODO(pthier, v8:11935): Remove for M113.
-    // IsUnicodeMode() is true for both /u and /v, but this method is only
-    // called for /u.
-    if (IsUnicodeMode() && isolate() != nullptr) {
-      const bool unicode_sets_invalid =
-          IsClassSetSyntaxCharacter(*char_out) ||
-          IsClassSetReservedDoublePunctuator(*char_out);
-      if (unicode_sets_invalid) {
-        isolate()->CountUsage(
-            v8::Isolate::kRegExpUnicodeSetIncompatibilitiesWithUnicodeMode);
-      }
-    }
     Advance();
     return;
   }
@@ -2527,8 +2499,7 @@ RegExpTree* RegExpParserImpl<CharT>::ParseClassStringDisjunction(
 
   ZoneList<base::uc32>* string =
       zone()->template New<ZoneList<base::uc32>>(4, zone());
-  RegExpTextBuilder::SmallRegExpTreeVector string_storage(
-      ZoneAllocator<RegExpTree*>{zone()});
+  RegExpTextBuilder::SmallRegExpTreeVector string_storage(zone());
   RegExpTextBuilder string_builder(zone(), &string_storage, flags());
 
   while (has_more() && current() != '}') {
@@ -2553,6 +2524,7 @@ RegExpTree* RegExpParserImpl<CharT>::ParseClassStringDisjunction(
   }
 
   AddClassString(string, string_builder.ToRegExp(), ranges, strings, zone());
+  CharacterRange::Canonicalize(ranges);
 
   // We don't need to handle missing closing '}' here.
   // If the character class is correctly closed, ParseClassSetCharacter will
@@ -2793,6 +2765,14 @@ RegExpTree* RegExpParserImpl<CharT>::ParseClassUnion(
 
   if (is_negated && may_contain_strings) {
     return ReportError(RegExpError::kNegatedCharacterClassWithStrings);
+  }
+
+  if (operands->is_empty()) {
+    // Return empty expression if no operands were added (e.g. [\P{Any}]
+    // produces an empty range).
+    DCHECK(ranges->is_empty());
+    DCHECK(strings->empty());
+    return RegExpClassSetExpression::Empty(zone(), is_negated);
   }
 
   return zone()->template New<RegExpClassSetExpression>(
@@ -3117,13 +3097,13 @@ bool RegExpParser::ParseRegExpFromHeapString(Isolate* isolate, Zone* zone,
   String::FlatContent content = input->GetFlatContent(no_gc);
   if (content.IsOneByte()) {
     base::Vector<const uint8_t> v = content.ToOneByteVector();
-    return RegExpParserImpl<uint8_t>{isolate,     v.begin(), v.length(), flags,
-                                     stack_limit, zone,      no_gc}
+    return RegExpParserImpl<uint8_t>{v.begin(),   v.length(), flags,
+                                     stack_limit, zone,       no_gc}
         .Parse(result);
   } else {
     base::Vector<const base::uc16> v = content.ToUC16Vector();
-    return RegExpParserImpl<base::uc16>{
-        isolate, v.begin(), v.length(), flags, stack_limit, zone, no_gc}
+    return RegExpParserImpl<base::uc16>{v.begin(),   v.length(), flags,
+                                        stack_limit, zone,       no_gc}
         .Parse(result);
   }
 }
@@ -3135,14 +3115,8 @@ bool RegExpParser::VerifyRegExpSyntax(Zone* zone, uintptr_t stack_limit,
                                       RegExpFlags flags,
                                       RegExpCompileData* result,
                                       const DisallowGarbageCollection& no_gc) {
-  // TODO(pthier, v8:11935): Isolate is only temporarily used to increment the
-  // UseCounter for unicode set incompabilities in unicode mode.
-  // This method is only used in the parser for early-errors. To avoid passing
-  // the isolate through we simply pass a nullptr. This also has the positive
-  // side-effect of not incrementing the UseCounter multiple times.
-  Isolate* isolate = nullptr;
-  return RegExpParserImpl<CharT>{isolate,     input, input_length, flags,
-                                 stack_limit, zone,  no_gc}
+  return RegExpParserImpl<CharT>{input,       input_length, flags,
+                                 stack_limit, zone,         no_gc}
       .Parse(result);
 }
 

@@ -273,6 +273,13 @@ class WasmScript : public Script {
   int CodeOffset() const;
   int CodeLength() const;
 };
+
+// "Static" version of WasmScript::Disassemble, for use with cached scripts
+// where we only have raw wire bytes available.
+void Disassemble(base::Vector<const uint8_t> wire_bytes,
+                 DisassemblyCollector* collector,
+                 std::vector<int>* function_body_offsets);
+
 #endif  // V8_ENABLE_WEBASSEMBLY
 
 V8_EXPORT_PRIVATE void GetLoadedScripts(
@@ -514,6 +521,7 @@ class V8_EXPORT_PRIVATE StackTraceIterator {
   virtual v8::Local<v8::String> GetFunctionDebugName() const = 0;
   virtual v8::Local<v8::debug::Script> GetScript() const = 0;
   virtual debug::Location GetSourceLocation() const = 0;
+  virtual debug::Location GetFunctionLocation() const = 0;
   virtual v8::Local<v8::Function> GetFunction() const = 0;
   virtual std::unique_ptr<ScopeIterator> GetScopeIterator() const = 0;
   virtual bool CanBeRestarted() const = 0;

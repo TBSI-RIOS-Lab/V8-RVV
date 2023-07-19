@@ -123,7 +123,6 @@ bool CodeRange::InitReservation(v8::PageAllocator* page_allocator,
   VirtualMemoryCage::ReservationParams params;
   params.page_allocator = page_allocator;
   params.reservation_size = requested;
-  params.base_bias_size = 0;
   params.page_size = kPageSize;
   params.jit =
       v8_flags.jitless ? JitPermission::kNoJit : JitPermission::kMapAsJittable;
@@ -132,6 +131,7 @@ bool CodeRange::InitReservation(v8::PageAllocator* page_allocator,
   // TODO(v8:11880): Use base_alignment here once ChromeOS issue is fixed.
   Address the_hint =
       GetCodeRangeAddressHint()->GetAddressHint(requested, allocate_page_size);
+  the_hint = RoundDown(the_hint, base_alignment);
 
   constexpr size_t kRadiusInMB =
       kMaxPCRelativeCodeRangeInMB > 1024 ? kMaxPCRelativeCodeRangeInMB : 4096;
@@ -233,9 +233,11 @@ bool CodeRange::InitReservation(v8::PageAllocator* page_allocator,
     CHECK_EQ(reserved_area, 0);
     void* base = reinterpret_cast<void*>(page_allocator_->begin());
     size_t size = page_allocator_->size();
-    CHECK(params.page_allocator->SetPermissions(
-        base, size, PageAllocator::kReadWriteExecute));
-    CHECK(params.page_allocator->DiscardSystemPages(base, size));
+    if (!params.page_allocator->SetPermissions(
+            base, size, PageAllocator::kReadWriteExecute)) {
+      return false;
+    }
+    if (!params.page_allocator->DiscardSystemPages(base, size)) return false;
   }
   return true;
 }
@@ -362,7 +364,7 @@ uint8_t* CodeRange::RemapEmbeddedBuiltins(Isolate* isolate,
   embedded_blob_code_copy =
       reinterpret_cast<uint8_t*>(page_allocator()->AllocatePages(
           hint, allocate_code_size, kAllocatePageSize,
-          PageAllocator::kNoAccess));
+          PageAllocator::kNoAccessWillJitLater));
 
   if (!embedded_blob_code_copy) {
     V8::FatalProcessOutOfMemory(

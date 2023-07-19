@@ -53,10 +53,23 @@ inline v8::internal::Handle<v8::internal::Object> FromCData(
 template <class From, class To>
 inline Local<To> Utils::Convert(v8::internal::Handle<From> obj) {
   DCHECK(obj.is_null() || (obj->IsSmi() || !obj->IsTheHole()));
-#ifdef V8_ENABLE_CONSERVATIVE_STACK_SCANNING
+#ifdef V8_ENABLE_DIRECT_LOCAL
   if (obj.is_null()) return Local<To>();
 #endif
-  return Local<To>(internal::ValueHelper::SlotAsValue<To>(obj.location()));
+  return Local<To>::FromSlot(obj.location());
+}
+
+template <class From, class To>
+inline Local<To> Utils::Convert(v8::internal::DirectHandle<From> obj,
+                                v8::internal::Isolate* isolate) {
+#if defined(V8_ENABLE_DIRECT_LOCAL)
+  DCHECK(obj.is_null() || (obj->IsSmi() || !obj->IsTheHole()));
+  return Local<To>::FromAddress(obj.address());
+#elif defined(V8_ENABLE_DIRECT_HANDLE)
+  return Utils::Convert<From, To>(v8::internal::Handle<From>(*obj, isolate));
+#else
+  return Utils::Convert<From, To>(obj);
+#endif
 }
 
 // Implementations of ToLocal
@@ -66,6 +79,16 @@ inline Local<To> Utils::Convert(v8::internal::Handle<From> obj) {
     return Convert<v8::internal::From, v8::To>(obj);                        \
   }
 
+#define MAKE_TO_LOCAL_DIRECT_HANDLE(Name, From, To)           \
+  Local<v8::To> Utils::Name(                                  \
+      v8::internal::DirectHandle<v8::internal::From> obj,     \
+      i::Isolate* isolate) {                                  \
+    return Convert<v8::internal::From, v8::To>(obj, isolate); \
+  }
+
+TO_LOCAL_LIST(MAKE_TO_LOCAL)
+TO_LOCAL_LIST(MAKE_TO_LOCAL_DIRECT_HANDLE)
+
 #define MAKE_TO_LOCAL_TYPED_ARRAY(Type, typeName, TYPE, ctype)        \
   Local<v8::Type##Array> Utils::ToLocal##Type##Array(                 \
       v8::internal::Handle<v8::internal::JSTypedArray> obj) {         \
@@ -73,81 +96,53 @@ inline Local<To> Utils::Convert(v8::internal::Handle<From> obj) {
     return Convert<v8::internal::JSTypedArray, v8::Type##Array>(obj); \
   }
 
-MAKE_TO_LOCAL(ToLocal, AccessorPair, debug::AccessorPair)
-MAKE_TO_LOCAL(ToLocal, Context, Context)
-MAKE_TO_LOCAL(ToLocal, Object, Value)
-MAKE_TO_LOCAL(ToLocal, Module, Module)
-MAKE_TO_LOCAL(ToLocal, Name, Name)
-MAKE_TO_LOCAL(ToLocal, String, String)
-MAKE_TO_LOCAL(ToLocal, Symbol, Symbol)
-MAKE_TO_LOCAL(ToLocal, JSRegExp, RegExp)
-MAKE_TO_LOCAL(ToLocal, JSReceiver, Object)
-MAKE_TO_LOCAL(ToLocal, JSObject, Object)
-MAKE_TO_LOCAL(ToLocal, JSFunction, Function)
-MAKE_TO_LOCAL(ToLocal, JSArray, Array)
-MAKE_TO_LOCAL(ToLocal, JSMap, Map)
-MAKE_TO_LOCAL(ToLocal, JSSet, Set)
-MAKE_TO_LOCAL(ToLocal, JSProxy, Proxy)
-MAKE_TO_LOCAL(ToLocal, JSArrayBuffer, ArrayBuffer)
-MAKE_TO_LOCAL(ToLocal, JSArrayBufferView, ArrayBufferView)
-MAKE_TO_LOCAL(ToLocal, JSDataView, DataView)
-MAKE_TO_LOCAL(ToLocal, JSRabGsabDataView, DataView)
-MAKE_TO_LOCAL(ToLocal, JSTypedArray, TypedArray)
-MAKE_TO_LOCAL(ToLocalShared, JSArrayBuffer, SharedArrayBuffer)
-
 TYPED_ARRAYS(MAKE_TO_LOCAL_TYPED_ARRAY)
-
-MAKE_TO_LOCAL(ToLocal, FunctionTemplateInfo, FunctionTemplate)
-MAKE_TO_LOCAL(ToLocal, ObjectTemplateInfo, ObjectTemplate)
-MAKE_TO_LOCAL(SignatureToLocal, FunctionTemplateInfo, Signature)
-MAKE_TO_LOCAL(MessageToLocal, Object, Message)
-MAKE_TO_LOCAL(PromiseToLocal, JSObject, Promise)
-MAKE_TO_LOCAL(StackTraceToLocal, FixedArray, StackTrace)
-MAKE_TO_LOCAL(StackFrameToLocal, StackFrameInfo, StackFrame)
-MAKE_TO_LOCAL(NumberToLocal, Object, Number)
-MAKE_TO_LOCAL(IntegerToLocal, Object, Integer)
-MAKE_TO_LOCAL(Uint32ToLocal, Object, Uint32)
-MAKE_TO_LOCAL(ToLocal, BigInt, BigInt)
-MAKE_TO_LOCAL(ExternalToLocal, JSObject, External)
-MAKE_TO_LOCAL(CallableToLocal, JSReceiver, Function)
-MAKE_TO_LOCAL(ToLocalPrimitive, Object, Primitive)
-MAKE_TO_LOCAL(FixedArrayToLocal, FixedArray, FixedArray)
-MAKE_TO_LOCAL(PrimitiveArrayToLocal, FixedArray, PrimitiveArray)
-MAKE_TO_LOCAL(ToLocal, ScriptOrModule, ScriptOrModule)
 
 #undef MAKE_TO_LOCAL_TYPED_ARRAY
 #undef MAKE_TO_LOCAL
+#undef MAKE_TO_LOCAL_DIRECT_HANDLE
+#undef TO_LOCAL_LIST
 
 // Implementations of OpenHandle
 
-#ifdef V8_ENABLE_CONSERVATIVE_STACK_SCANNING
+#ifdef V8_ENABLE_DIRECT_LOCAL
 
 #define MAKE_OPEN_HANDLE(From, To)                                            \
   v8::internal::Handle<v8::internal::To> Utils::OpenHandle(                   \
       const v8::From* that, bool allow_empty_handle) {                        \
-    DCHECK(allow_empty_handle ||                                              \
-           that != v8::internal::ValueHelper::EmptyValue<v8::From>());        \
+    DCHECK(allow_empty_handle || !v8::internal::ValueHelper::IsEmpty(that));  \
     DCHECK(                                                                   \
-        that == v8::internal::ValueHelper::EmptyValue<v8::From>() ||          \
+        v8::internal::ValueHelper::IsEmpty(that) ||                           \
         v8::internal::Object(v8::internal::ValueHelper::ValueAsAddress(that)) \
             .Is##To());                                                       \
-    if (that == v8::internal::ValueHelper::EmptyValue<v8::From>()) {          \
+    if (v8::internal::ValueHelper::IsEmpty(that)) {                           \
       return v8::internal::Handle<v8::internal::To>::null();                  \
     }                                                                         \
     return v8::internal::Handle<v8::internal::To>(                            \
         v8::HandleScope::CreateHandleForCurrentIsolate(                       \
-            reinterpret_cast<v8::internal::Address>(that)));                  \
+            v8::internal::ValueHelper::ValueAsAddress(that)));                \
   }
 
-#else
+#define MAKE_OPEN_DIRECT_HANDLE(From, To)                                     \
+  v8::internal::DirectHandle<v8::internal::To> Utils::OpenDirectHandle(       \
+      const v8::From* that, bool allow_empty_handle) {                        \
+    DCHECK(allow_empty_handle || !v8::internal::ValueHelper::IsEmpty(that));  \
+    DCHECK(                                                                   \
+        v8::internal::ValueHelper::IsEmpty(that) ||                           \
+        v8::internal::Object(v8::internal::ValueHelper::ValueAsAddress(that)) \
+            .Is##To());                                                       \
+    return v8::internal::DirectHandle<v8::internal::To>(                      \
+        v8::internal::ValueHelper::ValueAsAddress(that));                     \
+  }
+
+#else  // !V8_ENABLE_DIRECT_LOCAL
 
 #define MAKE_OPEN_HANDLE(From, To)                                            \
   v8::internal::Handle<v8::internal::To> Utils::OpenHandle(                   \
       const v8::From* that, bool allow_empty_handle) {                        \
-    DCHECK(allow_empty_handle ||                                              \
-           that != v8::internal::ValueHelper::EmptyValue<v8::From>());        \
+    DCHECK(allow_empty_handle || !v8::internal::ValueHelper::IsEmpty(that));  \
     DCHECK(                                                                   \
-        that == v8::internal::ValueHelper::EmptyValue<v8::From>() ||          \
+        v8::internal::ValueHelper::IsEmpty(that) ||                           \
         v8::internal::Object(v8::internal::ValueHelper::ValueAsAddress(that)) \
             .Is##To());                                                       \
     return v8::internal::Handle<v8::internal::To>(                            \
@@ -155,11 +150,19 @@ MAKE_TO_LOCAL(ToLocal, ScriptOrModule, ScriptOrModule)
             const_cast<v8::From*>(that)));                                    \
   }
 
-#endif
+#define MAKE_OPEN_DIRECT_HANDLE(From, To)                                      \
+  v8::internal::DirectHandle<v8::internal::To> Utils::OpenDirectHandle(        \
+      const v8::From* that, bool allow_empty_handle) {                         \
+    return Utils::OpenHandle(that, allow_empty_handle); \
+  }
+
+#endif  // V8_ENABLE_DIRECT_LOCAL
 
 OPEN_HANDLE_LIST(MAKE_OPEN_HANDLE)
+OPEN_HANDLE_LIST(MAKE_OPEN_DIRECT_HANDLE)
 
 #undef MAKE_OPEN_HANDLE
+#undef MAKE_OPEN_DIRECT_HANDLE
 #undef OPEN_HANDLE_LIST
 
 template <bool do_callback>
@@ -339,39 +342,37 @@ inline bool V8_EXPORT TryToCopyAndConvertArrayToCppBuffer(Local<Array> src,
 
 namespace internal {
 
-void HandleScopeImplementer::EnterContext(Context context) {
+void HandleScopeImplementer::EnterContext(NativeContext context) {
   DCHECK_EQ(entered_contexts_.capacity(), is_microtask_context_.capacity());
   DCHECK_EQ(entered_contexts_.size(), is_microtask_context_.size());
-  DCHECK(context.IsNativeContext());
   entered_contexts_.push_back(context);
   is_microtask_context_.push_back(0);
 }
 
-void HandleScopeImplementer::EnterMicrotaskContext(Context context) {
+void HandleScopeImplementer::EnterMicrotaskContext(NativeContext context) {
   DCHECK_EQ(entered_contexts_.capacity(), is_microtask_context_.capacity());
   DCHECK_EQ(entered_contexts_.size(), is_microtask_context_.size());
-  DCHECK(context.IsNativeContext());
   entered_contexts_.push_back(context);
   is_microtask_context_.push_back(1);
 }
 
-Handle<Context> HandleScopeImplementer::LastEnteredContext() {
+Handle<NativeContext> HandleScopeImplementer::LastEnteredContext() {
   DCHECK_EQ(entered_contexts_.capacity(), is_microtask_context_.capacity());
   DCHECK_EQ(entered_contexts_.size(), is_microtask_context_.size());
 
   for (size_t i = 0; i < entered_contexts_.size(); ++i) {
     size_t j = entered_contexts_.size() - i - 1;
     if (!is_microtask_context_.at(j)) {
-      return Handle<Context>(entered_contexts_.at(j), isolate_);
+      return handle(entered_contexts_.at(j), isolate_);
     }
   }
 
-  return Handle<Context>::null();
+  return {};
 }
 
-Handle<Context> HandleScopeImplementer::LastEnteredOrMicrotaskContext() {
-  if (entered_contexts_.empty()) return Handle<Context>::null();
-  return Handle<Context>(entered_contexts_.back(), isolate_);
+Handle<NativeContext> HandleScopeImplementer::LastEnteredOrMicrotaskContext() {
+  if (entered_contexts_.empty()) return {};
+  return handle(entered_contexts_.back(), isolate_);
 }
 
 }  // namespace internal

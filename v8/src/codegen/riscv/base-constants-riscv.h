@@ -313,8 +313,17 @@ const uint32_t kRvcBImm8Mask = (((1 << 5) - 1) << 2) | (((1 << 3) - 1) << 10);
 
 // for RVV extension
 constexpr int kRvvELEN = 64;
+#ifdef RVV_VLEN
+constexpr int kRvvVLEN = RVV_VLEN;
+// TODO(riscv): support rvv 256/512/1024
+static_assert(
+    kRvvVLEN == 128,
+    "RVV extension only supports 128bit wide VLEN at current RISC-V backend.");
+#else
 constexpr int kRvvVLEN = 128;
+#endif
 constexpr int kRvvSLEN = kRvvVLEN;
+
 const int kRvvFunct6Shift = 26;
 const int kRvvFunct6Bits = 6;
 const uint32_t kRvvFunct6Mask =
@@ -1214,7 +1223,7 @@ class Instruction : public InstructionGetters<InstructionBase> {
   // reference to an instruction is to convert a pointer. There is no way
   // to allocate or create instances of class Instruction.
   // Use the At(pc) function to create references to Instruction.
-  static Instruction* At(byte* pc) {
+  static Instruction* At(uint8_t* pc) {
     return reinterpret_cast<Instruction*>(pc);
   }
 

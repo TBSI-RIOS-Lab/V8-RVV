@@ -56,10 +56,9 @@ void SpillPlacer::Add(TopLevelLiveRange* range) {
        child = child->next()) {
     if (child->spilled()) {
       // Add every block that contains part of this live range.
-      for (UseInterval* interval = child->first_interval(); interval != nullptr;
-           interval = interval->next()) {
+      for (const UseInterval& interval : child->intervals()) {
         RpoNumber start_block =
-            code->GetInstructionBlock(interval->start().ToInstructionIndex())
+            code->GetInstructionBlock(interval.start().ToInstructionIndex())
                 ->rpo_number();
         if (start_block == top_start_block_number) {
           // Can't do late spilling if the first spill is within the
@@ -69,7 +68,7 @@ void SpillPlacer::Add(TopLevelLiveRange* range) {
           DCHECK(!IsLatestVreg(range->vreg()));
           return;
         }
-        LifetimePosition end = interval->end();
+        LifetimePosition end = interval.end();
         int end_instruction = end.ToInstructionIndex();
         // The end position is exclusive, so an end position exactly on a block
         // boundary indicates that the range applies only to the prior block.
@@ -86,8 +85,7 @@ void SpillPlacer::Add(TopLevelLiveRange* range) {
       }
     } else {
       // Add every block that contains a use which requires the on-stack value.
-      for (const UsePosition* pos = child->first_pos(); pos != nullptr;
-           pos = pos->next()) {
+      for (const UsePosition* pos : child->positions()) {
         if (pos->type() != UsePositionType::kRequiresSlot) continue;
         InstructionBlock* block =
             code->GetInstructionBlock(pos->pos().ToInstructionIndex());
@@ -211,12 +209,12 @@ int SpillPlacer::GetOrCreateIndexForLatestVreg(int vreg) {
       DCHECK_EQ(entries_, nullptr);
       // We lazily allocate these arrays because many functions don't have any
       // values that use SpillPlacer.
-      entries_ =
-          zone_->NewArray<Entry>(data()->code()->instruction_blocks().size());
+      entries_ = zone_->AllocateArray<Entry>(
+          data()->code()->instruction_blocks().size());
       for (size_t i = 0; i < data()->code()->instruction_blocks().size(); ++i) {
         new (&entries_[i]) Entry();
       }
-      vreg_numbers_ = zone_->NewArray<int>(kValueIndicesPerEntry);
+      vreg_numbers_ = zone_->AllocateArray<int>(kValueIndicesPerEntry);
     }
 
     if (assigned_indices_ == kValueIndicesPerEntry) {

@@ -9,9 +9,6 @@
 #include "src/objects/instance-type.h"
 #include "src/objects/objects.h"
 #include "src/objects/tagged-field.h"
-#include "src/roots/roots.h"
-#include "src/torque/runtime-macro-shims.h"
-#include "src/torque/runtime-support.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -21,6 +18,9 @@ namespace internal {
 
 class Heap;
 class PrimitiveHeapObject;
+class ExternalPointerSlot;
+template <typename T>
+class Tagged;
 
 // HeapObject is the superclass for all classes describing heap allocated
 // objects.
@@ -113,6 +113,7 @@ class HeapObject : public Object {
   V8_INLINE bool Is##Type(ReadOnlyRoots roots) const;   \
   V8_INLINE bool Is##Type() const;
   ODDBALL_LIST(IS_TYPE_FUNCTION_DECL)
+  HOLE_LIST(IS_TYPE_FUNCTION_DECL)
   IS_TYPE_FUNCTION_DECL(NullOrUndefined, , /* unused */)
 #undef IS_TYPE_FUNCTION_DECL
 
@@ -125,9 +126,10 @@ class HeapObject : public Object {
   V8_INLINE bool IsJSObjectThatCanBeTrackedAsPrototype() const;
 
   // Converts an address to a HeapObject pointer.
+  // TODO(leszeks): Move to Tagged<HeapObject>
   static inline HeapObject FromAddress(Address address) {
     DCHECK_TAG_ALIGNED(address);
-    return HeapObject(address + kHeapObjectTag);
+    return HeapObject::unchecked_cast(Object(address + kHeapObjectTag));
   }
 
   // Returns the address of this HeapObject.
@@ -140,6 +142,9 @@ class HeapObject : public Object {
 
   template <typename ObjectVisitor>
   inline void IterateFast(PtrComprCageBase cage_base, ObjectVisitor* v);
+
+  template <typename ObjectVisitor>
+  inline void IterateFast(Map map, ObjectVisitor* v);
 
   template <typename ObjectVisitor>
   inline void IterateFast(Map map, int object_size, ObjectVisitor* v);
@@ -178,7 +183,7 @@ class HeapObject : public Object {
   // during marking GC.
   inline ObjectSlot RawField(int byte_offset) const;
   inline MaybeObjectSlot RawMaybeWeakField(int byte_offset) const;
-  inline CodeObjectSlot RawCodeField(int byte_offset) const;
+  inline InstructionStreamSlot RawInstructionStreamField(int byte_offset) const;
   inline ExternalPointerSlot RawExternalPointerField(int byte_offset) const;
 
   DECL_CAST(HeapObject)
@@ -243,11 +248,6 @@ class HeapObject : public Object {
   inline Address GetFieldAddress(int field_offset) const;
 
  protected:
-  // Special-purpose constructor for subclasses that have fast paths where
-  // their ptr() is a Smi.
-  enum class AllowInlineSmiStorage { kRequireHeapObjectTag, kAllowBeingASmi };
-  inline HeapObject(Address ptr, AllowInlineSmiStorage allow_smi);
-
   OBJECT_CONSTRUCTORS(HeapObject, Object);
 
  private:

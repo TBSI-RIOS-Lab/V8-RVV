@@ -7,6 +7,7 @@
 
 #include "src/base/logging.h"
 #include "src/heap/heap-write-barrier-inl.h"
+#include "src/objects/instance-type-inl.h"
 #include "src/objects/map-inl.h"
 #include "src/objects/name.h"
 #include "src/objects/primitive-heap-object-inl.h"
@@ -242,8 +243,12 @@ bool Name::TryGetHash(uint32_t* hash) const {
   return false;
 }
 
-DEF_GETTER(Name, IsInterestingSymbol, bool) {
-  return IsSymbol(cage_base) && Symbol::cast(*this).is_interesting_symbol();
+bool Name::IsInteresting(Isolate* isolate) {
+  // TODO(ishell): consider using ReadOnlyRoots::IsNameForProtector() trick for
+  // these strings and interesting symbols.
+  return (IsSymbol() && Symbol::cast(*this).is_interesting_symbol()) ||
+         *this == *isolate->factory()->toJSON_string() ||
+         *this == *isolate->factory()->get_string();
 }
 
 DEF_GETTER(Name, IsPrivate, bool) {

@@ -202,13 +202,14 @@ void LiftoffAssembler::AlignFrameSize() {
 }
 
 void LiftoffAssembler::PatchPrepareStackFrame(
-    int offset, SafepointTableBuilder* safepoint_table_builder) {
+    int offset, SafepointTableBuilder* safepoint_table_builder,
+    bool feedback_vector_slot) {
   // The frame_size includes the frame marker and the instance slot. Both are
   // pushed as part of frame construction, so we don't need to allocate memory
   // for them anymore.
   int frame_size = GetTotalFrameSize() - 2 * kSystemPointerSize;
   // The frame setup builtin also pushes the feedback vector.
-  if (v8_flags.wasm_speculative_inlining) {
+  if (feedback_vector_slot) {
     frame_size -= kSystemPointerSize;
   }
   DCHECK_EQ(0, frame_size % kSystemPointerSize);
@@ -2362,12 +2363,12 @@ void EmitSimdShiftOp(LiftoffAssembler* assm, LiftoffRegister dst,
   }
 }
 
-template <void (Assembler::*avx_op)(XMMRegister, XMMRegister, byte),
-          void (Assembler::*sse_op)(XMMRegister, byte), uint8_t width>
+template <void (Assembler::*avx_op)(XMMRegister, XMMRegister, uint8_t),
+          void (Assembler::*sse_op)(XMMRegister, uint8_t), uint8_t width>
 void EmitSimdShiftOpImm(LiftoffAssembler* assm, LiftoffRegister dst,
                         LiftoffRegister operand, int32_t count) {
   constexpr int mask = (1 << width) - 1;
-  byte shift = static_cast<byte>(count & mask);
+  uint8_t shift = static_cast<uint8_t>(count & mask);
   if (CpuFeatures::IsSupported(AVX)) {
     CpuFeatureScope scope(assm, AVX);
     (assm->*avx_op)(dst.fp(), operand.fp(), shift);
@@ -3854,7 +3855,7 @@ void LiftoffAssembler::emit_f32x4_uconvert_i32x4(LiftoffRegister dst,
     psubd(dst.fp(), kScratchDoubleReg);
   }
   Cvtdq2ps(kScratchDoubleReg, kScratchDoubleReg);  // Convert lo exactly.
-  Psrld(dst.fp(), byte{1});            // Divide by 2 to get in unsigned range.
+  Psrld(dst.fp(), uint8_t{1});         // Divide by 2 to get in unsigned range.
   Cvtdq2ps(dst.fp(), dst.fp());        // Convert hi, exactly.
   Addps(dst.fp(), dst.fp());           // Double hi, exactly.
   Addps(dst.fp(), kScratchDoubleReg);  // Add hi and lo, may round.
@@ -4201,13 +4202,15 @@ void LiftoffAssembler::PopRegisters(LiftoffRegList regs) {
 void LiftoffAssembler::RecordSpillsInSafepoint(
     SafepointTableBuilder::Safepoint& safepoint, LiftoffRegList all_spills,
     LiftoffRegList ref_spills, int spill_offset) {
-  int spill_space_size = 0;
-  while (!all_spills.is_empty()) {
-    LiftoffRegister reg = all_spills.GetFirstRegSet();
+  LiftoffRegList fp_spills = all_spills & kFpCacheRegList;
+  int spill_space_size = fp_spills.GetNumRegsSet() * kSimd128Size;
+  LiftoffRegList gp_spills = all_spills & kGpCacheRegList;
+  while (!gp_spills.is_empty()) {
+    LiftoffRegister reg = gp_spills.GetFirstRegSet();
     if (ref_spills.has(reg)) {
       safepoint.DefineTaggedStackSlot(spill_offset);
     }
-    all_spills.clear(reg);
+    gp_spills.clear(reg);
     ++spill_offset;
     spill_space_size += kSystemPointerSize;
   }
@@ -4221,19 +4224,31 @@ void LiftoffAssembler::DropStackSlotsAndRet(uint32_t num_stack_slots) {
   ret(static_cast<int>(num_stack_slots * kSystemPointerSize));
 }
 
-void LiftoffAssembler::CallC(const ValueKindSig* sig,
-                             const LiftoffRegister* args,
-                             const LiftoffRegister* rets,
+void LiftoffAssembler::CallC(const std::initializer_list<VarState> args,
+                             const LiftoffRegister* rets, ValueKind return_kind,
                              ValueKind out_argument_kind, int stack_bytes,
                              ExternalReference ext_ref) {
   AllocateStackSpace(stack_bytes);
 
-  int arg_bytes = 0;
-  for (ValueKind param_kind : sig->parameters()) {
-    liftoff::StoreToStack(this, Operand(rsp, arg_bytes), *args++, param_kind);
-    arg_bytes += value_kind_size(param_kind);
+  int arg_offset = 0;
+  for (const VarState& arg : args) {
+    Operand dst{rsp, arg_offset};
+    if (arg.is_reg()) {
+      liftoff::StoreToStack(this, dst, arg.reg(), arg.kind());
+    } else if (arg.is_const()) {
+      DCHECK_EQ(kI32, arg.kind());
+      movl(dst, Immediate(arg.i32_const()));
+    } else if (value_kind_size(arg.kind()) == 4) {
+      movl(kScratchRegister, liftoff::GetStackSlot(arg.offset()));
+      movl(dst, kScratchRegister);
+    } else {
+      DCHECK_EQ(8, value_kind_size(arg.kind()));
+      movq(kScratchRegister, liftoff::GetStackSlot(arg.offset()));
+      movq(dst, kScratchRegister);
+    }
+    arg_offset += value_kind_size(arg.kind());
   }
-  DCHECK_LE(arg_bytes, stack_bytes);
+  DCHECK_LE(arg_offset, stack_bytes);
 
   // Pass a pointer to the buffer with the arguments to the C function.
   movq(arg_reg_1, rsp);
@@ -4246,11 +4261,10 @@ void LiftoffAssembler::CallC(const ValueKindSig* sig,
 
   // Move return value to the right register.
   const LiftoffRegister* next_result_reg = rets;
-  if (sig->return_count() > 0) {
-    DCHECK_EQ(1, sig->return_count());
+  if (return_kind != kVoid) {
     constexpr Register kReturnReg = rax;
     if (kReturnReg != next_result_reg->gp()) {
-      Move(*next_result_reg, LiftoffRegister(kReturnReg), sig->GetReturn(0));
+      Move(*next_result_reg, LiftoffRegister(kReturnReg), return_kind);
     }
     ++next_result_reg;
   }

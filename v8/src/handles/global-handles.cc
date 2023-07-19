@@ -23,6 +23,7 @@
 #include "src/heap/heap-inl.h"
 #include "src/heap/heap-write-barrier-inl.h"
 #include "src/heap/heap-write-barrier.h"
+#include "src/heap/local-heap.h"
 #include "src/init/v8.h"
 #include "src/logging/counters.h"
 #include "src/objects/objects-inl.h"
@@ -619,7 +620,7 @@ bool NeedsTrackingInYoungNodes(Object value, NodeType* node) {
 
 }  // namespace
 
-Handle<Object> GlobalHandles::Create(Object value) {
+Handle<Object> GlobalHandles::Create(Tagged<Object> value) {
   GlobalHandles::Node* node = regular_nodes_->Allocate();
   if (NeedsTrackingInYoungNodes(value, node)) {
     young_nodes_.push_back(node);
@@ -629,7 +630,7 @@ Handle<Object> GlobalHandles::Create(Object value) {
 }
 
 Handle<Object> GlobalHandles::Create(Address value) {
-  return Create(Object(value));
+  return Create(Tagged<Object>(value));
 }
 
 Handle<Object> GlobalHandles::CopyGlobal(Address* location) {

@@ -4,6 +4,7 @@
 
 #include "src/objects/js-function.h"
 
+#include "src/base/optional.h"
 #include "src/baseline/baseline-batch-compiler.h"
 #include "src/codegen/compiler.h"
 #include "src/common/globals.h"
@@ -229,9 +230,10 @@ void JSFunction::MarkForOptimization(Isolate* isolate, CodeKind target_kind,
   set_tiering_state(TieringStateFor(target_kind, mode));
 }
 
-void JSFunction::SetInterruptBudget(Isolate* isolate) {
+void JSFunction::SetInterruptBudget(
+    Isolate* isolate, base::Optional<CodeKind> override_active_tier) {
   raw_feedback_cell().set_interrupt_budget(
-      TieringManager::InterruptBudgetFor(isolate, *this));
+      TieringManager::InterruptBudgetFor(isolate, *this, override_active_tier));
 }
 
 // static
@@ -538,7 +540,7 @@ void JSFunction::EnsureClosureFeedbackCellArray(
       ClosureFeedbackCellArray::New(isolate, shared);
   // Many closure cell is used as a way to specify that there is no
   // feedback cell for this function and a new feedback cell has to be
-  // allocated for this funciton. For ex: for eval functions, we have to create
+  // allocated for this function. For ex: for eval functions, we have to create
   // a feedback cell and cache it along with the code. It is safe to use
   // many_closure_cell to indicate this because in regular cases, it should
   // already have a feedback_vector / feedback cell array allocated.
@@ -676,6 +678,10 @@ void SetInstancePrototype(Isolate* isolate, Handle<JSFunction> function,
       // At that point, a new initial map is created and the prototype is put
       // into the initial map where it belongs.
       function->set_prototype_or_initial_map(*value, kReleaseStore);
+      if (value->IsJSObjectThatCanBeTrackedAsPrototype()) {
+        // Optimize as prototype to detach it from its transition tree.
+        JSObject::OptimizeAsPrototype(Handle<JSObject>::cast(value));
+      }
     } else {
       Handle<Map> new_map =
           Map::Copy(isolate, initial_map, "SetInstancePrototype");
@@ -719,8 +725,15 @@ void JSFunction::SetPrototype(Handle<JSFunction> function,
     Handle<Map> new_map =
         Map::Copy(isolate, handle(function->map(), isolate), "SetPrototype");
 
-    new_map->SetConstructor(*value);
+    // Create a new {constructor, non-instance_prototype} tuple and store it
+    // in Map::constructor field.
+    Handle<Object> constructor(new_map->GetConstructor(), isolate);
+    Handle<Tuple2> non_instance_prototype_constructor_tuple =
+        isolate->factory()->NewTuple2(constructor, value, AllocationType::kOld);
+
     new_map->set_has_non_instance_prototype(true);
+    new_map->SetConstructor(*non_instance_prototype_constructor_tuple);
+
     JSObject::MigrateToMap(isolate, function, new_map);
 
     FunctionKind kind = function->shared().kind();
@@ -748,17 +761,16 @@ void JSFunction::SetInitialMap(Isolate* isolate, Handle<JSFunction> function,
 
 void JSFunction::SetInitialMap(Isolate* isolate, Handle<JSFunction> function,
                                Handle<Map> map, Handle<HeapObject> prototype,
-                               Handle<HeapObject> constructor) {
+                               Handle<JSFunction> constructor) {
   if (map->prototype() != *prototype) {
     Map::SetPrototype(isolate, map, prototype);
   }
-  DCHECK_IMPLIES(!constructor->IsJSFunction(), map->InSharedHeap());
   map->SetConstructor(*constructor);
   function->set_prototype_or_initial_map(*map, kReleaseStore);
   if (v8_flags.log_maps) {
     LOG(isolate, MapEvent("InitialMap", Handle<Map>(), map, "",
                           SharedFunctionInfo::DebugName(
-                              handle(function->shared(), isolate))));
+                              isolate, handle(function->shared(), isolate))));
   }
 }
 
@@ -801,8 +813,10 @@ void JSFunction::EnsureHasInitialMap(Handle<JSFunction> function) {
   Handle<HeapObject> prototype;
   if (function->has_instance_prototype()) {
     prototype = handle(function->instance_prototype(), isolate);
+    map->set_prototype(*prototype);
   } else {
     prototype = isolate->factory()->NewFunctionPrototype(function);
+    Map::SetPrototype(isolate, map, prototype);
   }
   DCHECK(map->has_fast_object_elements());
 
@@ -1219,7 +1233,8 @@ Handle<String> JSFunction::GetDebugName(Handle<JSFunction> function) {
         GetDataProperty(isolate, function, isolate->factory()->name_string());
     if (name->IsString()) return Handle<String>::cast(name);
   }
-  return SharedFunctionInfo::DebugName(handle(function->shared(), isolate));
+  return SharedFunctionInfo::DebugName(isolate,
+                                       handle(function->shared(), isolate));
 }
 
 bool JSFunction::SetName(Handle<JSFunction> function, Handle<Name> name,
@@ -1248,8 +1263,7 @@ bool JSFunction::SetName(Handle<JSFunction> function, Handle<Name> name,
 namespace {
 
 Handle<String> NativeCodeFunctionSourceString(
-    Handle<SharedFunctionInfo> shared_info) {
-  Isolate* const isolate = shared_info->GetIsolate();
+    Isolate* isolate, Handle<SharedFunctionInfo> shared_info) {
   IncrementalStringBuilder builder(isolate);
   builder.AppendCStringLiteral("function ");
   builder.AppendString(handle(shared_info->Name(), isolate));
@@ -1266,7 +1280,7 @@ Handle<String> JSFunction::ToString(Handle<JSFunction> function) {
 
   // Check if {function} should hide its source code.
   if (!shared_info->IsUserJavaScript()) {
-    return NativeCodeFunctionSourceString(shared_info);
+    return NativeCodeFunctionSourceString(isolate, shared_info);
   }
 
   if (IsClassConstructor(shared_info->kind())) {
@@ -1287,7 +1301,7 @@ Handle<String> JSFunction::ToString(Handle<JSFunction> function) {
 
   // Check if we have source code for the {function}.
   if (!shared_info->HasSourceCode()) {
-    return NativeCodeFunctionSourceString(shared_info);
+    return NativeCodeFunctionSourceString(isolate, shared_info);
   }
 
   // If this function was compiled from asm.js, use the recorded offset
@@ -1315,10 +1329,10 @@ Handle<String> JSFunction::ToString(Handle<JSFunction> function) {
     // giving inconsistent call behaviour.
     isolate->CountUsage(
         v8::Isolate::UseCounterFeature::kFunctionTokenOffsetTooLongForToString);
-    return NativeCodeFunctionSourceString(shared_info);
+    return NativeCodeFunctionSourceString(isolate, shared_info);
   }
   return Handle<String>::cast(
-      SharedFunctionInfo::GetSourceCodeHarmony(shared_info));
+      SharedFunctionInfo::GetSourceCodeHarmony(isolate, shared_info));
 }
 
 // static

@@ -21,6 +21,7 @@ class Value;
 namespace internal {
 class FunctionCallbackArguments;
 class PropertyCallbackArguments;
+class Builtins;
 }  // namespace internal
 
 namespace debug {
@@ -74,6 +75,10 @@ class ReturnValue {
   V8_INLINE void SetInternal(internal::Address value) { *value_ = value; }
   V8_INLINE internal::Address GetDefaultValue();
   V8_INLINE explicit ReturnValue(internal::Address* slot);
+
+  // See FunctionCallbackInfo.
+  static constexpr int kIsolateValueIndex = -2;
+
   internal::Address* value_;
 };
 
@@ -116,19 +121,34 @@ class FunctionCallbackInfo {
   V8_INLINE Isolate* GetIsolate() const;
   /** The ReturnValue for the call. */
   V8_INLINE ReturnValue<T> GetReturnValue() const;
-  // This shouldn't be public, but the arm compiler needs it.
-  static const int kArgsLength = 6;
 
- protected:
+ private:
   friend class internal::FunctionCallbackArguments;
   friend class internal::CustomArguments<FunctionCallbackInfo>;
   friend class debug::ConsoleCallArguments;
-  static const int kHolderIndex = 0;
-  static const int kIsolateIndex = 1;
-  static const int kReturnValueDefaultValueIndex = 2;
-  static const int kReturnValueIndex = 3;
-  static const int kDataIndex = 4;
-  static const int kNewTargetIndex = 5;
+  friend class internal::Builtins;
+
+  static constexpr int kHolderIndex = 0;
+  static constexpr int kIsolateIndex = 1;
+  static constexpr int kUnusedIndex = 2;
+  static constexpr int kReturnValueIndex = 3;
+  static constexpr int kDataIndex = 4;
+  static constexpr int kNewTargetIndex = 5;
+  static constexpr int kArgsLength = 6;
+
+  static constexpr int kArgsLengthWithReceiver = kArgsLength + 1;
+
+  // Codegen constants:
+  static constexpr int kSize = 3 * internal::kApiSystemPointerSize;
+  static constexpr int kImplicitArgsOffset = 0;
+  static constexpr int kValuesOffset =
+      kImplicitArgsOffset + internal::kApiSystemPointerSize;
+  static constexpr int kLengthOffset =
+      kValuesOffset + internal::kApiSystemPointerSize;
+
+  static constexpr int kThisValuesIndex = -1;
+  static_assert(ReturnValue<Value>::kIsolateValueIndex ==
+                kIsolateIndex - kReturnValueIndex);
 
   V8_INLINE FunctionCallbackInfo(internal::Address* implicit_args,
                                  internal::Address* values, int length);
@@ -229,22 +249,24 @@ class PropertyCallbackInfo {
    */
   V8_INLINE bool ShouldThrowOnError() const;
 
-  // This shouldn't be public, but the arm compiler needs it.
-  static const int kArgsLength = 7;
-
- protected:
+ private:
   friend class MacroAssembler;
   friend class internal::PropertyCallbackArguments;
   friend class internal::CustomArguments<PropertyCallbackInfo>;
-  static const int kShouldThrowOnErrorIndex = 0;
-  static const int kHolderIndex = 1;
-  static const int kIsolateIndex = 2;
-  static const int kReturnValueDefaultValueIndex = 3;
-  static const int kReturnValueIndex = 4;
-  static const int kDataIndex = 5;
-  static const int kThisIndex = 6;
+  static constexpr int kShouldThrowOnErrorIndex = 0;
+  static constexpr int kHolderIndex = 1;
+  static constexpr int kIsolateIndex = 2;
+  static constexpr int kUnusedIndex = 3;
+  static constexpr int kReturnValueIndex = 4;
+  static constexpr int kDataIndex = 5;
+  static constexpr int kThisIndex = 6;
+  static constexpr int kArgsLength = 7;
 
-  V8_INLINE PropertyCallbackInfo(internal::Address* args) : args_(args) {}
+  static constexpr int kSize = 1 * internal::kApiSystemPointerSize;
+
+  V8_INLINE explicit PropertyCallbackInfo(internal::Address* args)
+      : args_(args) {}
+
   internal::Address* args_;
 };
 
@@ -262,7 +284,7 @@ void ReturnValue<T>::Set(const Global<S>& handle) {
   if (V8_UNLIKELY(handle.IsEmpty())) {
     *value_ = GetDefaultValue();
   } else {
-    *value_ = *reinterpret_cast<internal::Address*>(*handle);
+    *value_ = handle.ptr();
   }
 }
 
@@ -273,7 +295,7 @@ void ReturnValue<T>::Set(const BasicTracedReference<S>& handle) {
   if (V8_UNLIKELY(handle.IsEmpty())) {
     *value_ = GetDefaultValue();
   } else {
-    *value_ = *reinterpret_cast<internal::Address*>(handle.val_);
+    *value_ = handle.ptr();
   }
 }
 
@@ -285,7 +307,7 @@ void ReturnValue<T>::Set(const Local<S> handle) {
   if (V8_UNLIKELY(handle.IsEmpty())) {
     *value_ = GetDefaultValue();
   } else {
-    *value_ = internal::ValueHelper::ValueAsAddress(*handle);
+    *value_ = handle.ptr();
   }
 }
 
@@ -354,8 +376,7 @@ void ReturnValue<T>::SetEmptyString() {
 
 template <typename T>
 Isolate* ReturnValue<T>::GetIsolate() const {
-  // Isolate is always the pointer below the default value on the stack.
-  return *reinterpret_cast<Isolate**>(&value_[-2]);
+  return *reinterpret_cast<Isolate**>(&value_[kIsolateValueIndex]);
 }
 
 template <typename T>
@@ -379,8 +400,8 @@ void ReturnValue<T>::Set(S* whatever) {
 
 template <typename T>
 internal::Address ReturnValue<T>::GetDefaultValue() {
-  // Default value is always the pointer below value_ on the stack.
-  return value_[-1];
+  using I = internal::Internals;
+  return I::GetRoot(GetIsolate(), I::kTheHoleValueRootIndex);
 }
 
 template <typename T>
@@ -399,7 +420,7 @@ Local<Value> FunctionCallbackInfo<T>::operator[](int i) const {
 template <typename T>
 Local<Object> FunctionCallbackInfo<T>::This() const {
   // values_ points to the first argument (not the receiver).
-  return Local<Object>::FromSlot(values_ - 1);
+  return Local<Object>::FromSlot(values_ + kThisValuesIndex);
 }
 
 template <typename T>

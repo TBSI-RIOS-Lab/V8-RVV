@@ -12,6 +12,7 @@
 #include "src/execution/isolate.h"
 #include "src/heap/factory.h"
 #include "src/objects/objects.h"
+#include "src/objects/string.h"
 #include "src/roots/roots.h"
 
 namespace v8 {
@@ -342,6 +343,10 @@ class JsonParser final {
   MessageTemplate LookUpErrorMessageForJsonToken(JsonToken token,
                                                  Handle<Object>& arg,
                                                  Handle<Object>& arg2, int pos);
+
+  // Calculate line and column based on the current cursor position.
+  // Both values start at 1.
+  void CalculateFileLocation(Handle<Object>& line, Handle<Object>& column);
   // Mark that a parsing error has happened at the current token.
   void ReportUnexpectedToken(
       JsonToken token,

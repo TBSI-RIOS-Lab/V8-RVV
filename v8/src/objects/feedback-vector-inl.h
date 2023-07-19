@@ -14,6 +14,7 @@
 #include "src/objects/shared-function-info.h"
 #include "src/objects/smi.h"
 #include "src/roots/roots-inl.h"
+#include "src/torque/runtime-macro-shims.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -138,11 +139,26 @@ void FeedbackVector::RequestOsrAtNextOpportunity() {
 void FeedbackVector::reset_osr_state() { set_osr_state(0); }
 
 bool FeedbackVector::maybe_has_optimized_osr_code() const {
-  return MaybeHasOptimizedOsrCodeBit::decode(osr_state());
+  return maybe_has_maglev_osr_code() || maybe_has_turbofan_osr_code();
 }
 
-void FeedbackVector::set_maybe_has_optimized_osr_code(bool value) {
-  set_osr_state(MaybeHasOptimizedOsrCodeBit::update(osr_state(), value));
+bool FeedbackVector::maybe_has_maglev_osr_code() const {
+  return MaybeHasMaglevOsrCodeBit::decode(osr_state());
+}
+
+bool FeedbackVector::maybe_has_turbofan_osr_code() const {
+  return MaybeHasTurbofanOsrCodeBit::decode(osr_state());
+}
+
+void FeedbackVector::set_maybe_has_optimized_osr_code(bool value,
+                                                      CodeKind code_kind) {
+  if (code_kind == CodeKind::MAGLEV) {
+    CHECK(v8_flags.maglev_osr);
+    set_osr_state(MaybeHasMaglevOsrCodeBit::update(osr_state(), value));
+  } else {
+    CHECK_EQ(code_kind, CodeKind::TURBOFAN);
+    set_osr_state(MaybeHasTurbofanOsrCodeBit::update(osr_state(), value));
+  }
 }
 
 Code FeedbackVector::optimized_code() const {
@@ -403,13 +419,13 @@ Symbol FeedbackVector::RawUninitializedSentinel(Isolate* isolate) {
 }
 
 bool FeedbackMetadataIterator::HasNext() const {
-  return next_slot_.ToInt() < metadata().slot_count();
+  return next_slot_.ToInt() < metadata()->slot_count();
 }
 
 FeedbackSlot FeedbackMetadataIterator::Next() {
   DCHECK(HasNext());
   cur_slot_ = next_slot_;
-  slot_kind_ = metadata().GetKind(cur_slot_);
+  slot_kind_ = metadata()->GetKind(cur_slot_);
   next_slot_ = FeedbackSlot(next_slot_.ToInt() + entry_size());
   return cur_slot_;
 }
@@ -487,6 +503,14 @@ template <typename T>
 struct IsValidFeedbackType
     : public std::integral_constant<bool,
                                     std::is_base_of<MaybeObject, T>::value ||
+                                        std::is_base_of<Object, T>::value> {
+  static_assert(kTaggedCanConvertToRawObjects);
+};
+
+template <typename T>
+struct IsValidFeedbackType<Tagged<T>>
+    : public std::integral_constant<bool,
+                                    std::is_base_of<MaybeObject, T>::value ||
                                         std::is_base_of<Object, T>::value> {};
 
 template <typename FeedbackType>
@@ -510,7 +534,7 @@ void FeedbackNexus::SetFeedback(FeedbackType feedback, WriteBarrierMode mode,
   config()->SetFeedbackPair(vector(), slot(), fmo, mode, fmo_extra, mode_extra);
 }
 
-Isolate* FeedbackNexus::GetIsolate() const { return vector().GetIsolate(); }
+Isolate* FeedbackNexus::GetIsolate() const { return vector()->GetIsolate(); }
 }  // namespace internal
 }  // namespace v8
 
