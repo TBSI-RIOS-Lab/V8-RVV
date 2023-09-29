@@ -88,6 +88,13 @@ ASSERT_TRIVIALLY_COPYABLE(Register);
 static_assert(sizeof(Register) <= sizeof(int),
               "Register can efficiently be passed by value");
 
+// Assign |source| value to |no_reg| and return the |source|'s previous value.
+inline Register ReassignRegister(Register& source) {
+  Register result = source;
+  source = Register::no_reg();
+  return result;
+}
+
 #define DECLARE_REGISTER(R) \
   constexpr Register R = Register::from_code(kRegCode_##R);
 GENERAL_REGISTERS(DECLARE_REGISTER)
@@ -294,8 +301,6 @@ constexpr Register kPtrComprCageBaseRegister = r14;  // callee save
 #else
 constexpr Register kPtrComprCageBaseRegister = no_reg;
 #endif
-
-constexpr Register kOffHeapTrampolineRegister = kScratchRegister;
 
 constexpr DoubleRegister kFPReturnRegister0 = xmm0;
 

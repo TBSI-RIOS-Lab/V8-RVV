@@ -976,19 +976,18 @@ Handle<HeapObject> RegExpMacroAssemblerX64::GetCode(Handle<String> source) {
       __ addq(Operand(rbp, kRegisterOutputOffset),
               Immediate(num_saved_registers_ * kIntSize));
 
-      // Prepare rax to initialize registers with its value in the next run.
-      __ movq(rax, Operand(rbp, kStringStartMinusOneOffset));
-
       // Restore the original regexp stack pointer value (effectively, pop the
       // stored base pointer).
       PopRegExpBasePointer(backtrack_stackpointer(), kScratchRegister);
+
+      Label reload_string_start_minus_one;
 
       if (global_with_zero_length_check()) {
         // Special case for zero-length matches.
         // rdx: capture start index
         __ cmpq(rdi, rdx);
         // Not a zero-length match, restart.
-        __ j(not_equal, &load_char_start_regexp);
+        __ j(not_equal, &reload_string_start_minus_one);
         // rdi (offset from the end) is zero if we already reached the end.
         __ testq(rdi, rdi);
         __ j(zero, &exit_label_, Label::kNear);
@@ -1002,6 +1001,11 @@ Handle<HeapObject> RegExpMacroAssemblerX64::GetCode(Handle<String> source) {
         }
         if (global_unicode()) CheckNotInSurrogatePair(0, &advance);
       }
+
+      __ bind(&reload_string_start_minus_one);
+      // Prepare rax to initialize registers with its value in the next run.
+      // Must be immediately before the jump to avoid clobbering.
+      __ movq(rax, Operand(rbp, kStringStartMinusOneOffset));
 
       __ jmp(&load_char_start_regexp);
     } else {
@@ -1123,10 +1127,9 @@ Handle<HeapObject> RegExpMacroAssemblerX64::GetCode(Handle<String> source) {
   Handle<Code> code = Factory::CodeBuilder(isolate, code_desc, CodeKind::REGEXP)
                           .set_self_reference(masm_.CodeObject())
                           .Build();
-  Handle<InstructionStream> istream(code->instruction_stream(), isolate);
   PROFILE(isolate,
           RegExpCodeCreateEvent(Handle<AbstractCode>::cast(code), source));
-  return Handle<HeapObject>::cast(istream);
+  return Handle<HeapObject>::cast(code);
 }
 
 void RegExpMacroAssemblerX64::GoTo(Label* to) { BranchOrBacktrack(to); }
@@ -1315,8 +1318,8 @@ int RegExpMacroAssemblerX64::CheckStackGuardState(Address* return_address,
           frame_entry<int>(re_frame, kDirectCallOffset)),
       return_address, re_code,
       frame_entry_address<Address>(re_frame, kInputStringOffset),
-      frame_entry_address<const byte*>(re_frame, kInputStartOffset),
-      frame_entry_address<const byte*>(re_frame, kInputEndOffset));
+      frame_entry_address<const uint8_t*>(re_frame, kInputStartOffset),
+      frame_entry_address<const uint8_t*>(re_frame, kInputEndOffset));
 }
 
 

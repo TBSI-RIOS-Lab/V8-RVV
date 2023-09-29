@@ -14,6 +14,7 @@ namespace v8 {
 namespace internal {
 
 class Object;
+class TaggedBase;
 
 template <typename Subclass, typename Data,
           size_t SlotDataAlignment = sizeof(Data)>
@@ -103,14 +104,15 @@ class FullObjectSlot : public SlotBase<FullObjectSlot, Address> {
   explicit FullObjectSlot(const Address* ptr)
       : SlotBase(reinterpret_cast<Address>(ptr)) {}
   inline explicit FullObjectSlot(Object* object);
+  inline explicit FullObjectSlot(TaggedBase* object);
   template <typename T>
   explicit FullObjectSlot(SlotBase<T, TData, kSlotDataAlignment> slot)
       : SlotBase(slot.address()) {}
 
   // Compares memory representation of a value stored in the slot with given
   // raw value.
-  inline bool contains_value(Address raw_value) const;
   inline bool contains_map_value(Address raw_value) const;
+  inline bool Relaxed_ContainsMapValue(Address raw_value) const;
 
   inline Object operator*() const;
   inline Object load(PtrComprCageBase cage_base) const;
@@ -329,6 +331,8 @@ class ExternalPointerSlot
   inline const ExternalPointerTable& GetExternalPointerTableForTag(
       const Isolate* isolate, ExternalPointerTag tag);
   inline ExternalPointerTable& GetExternalPointerTableForTag(
+      Isolate* isolate, ExternalPointerTag tag);
+  inline ExternalPointerTable::Space* GetDefaultExternalPointerSpace(
       Isolate* isolate, ExternalPointerTag tag);
 #endif  // V8_ENABLE_SANDBOX
 };

@@ -19,17 +19,6 @@ void MarkingBarrier::MarkValue(HeapObject host, HeapObject value) {
   DCHECK(IsCurrentMarkingBarrier(host));
   DCHECK(is_activated_ || shared_heap_worklist_.has_value());
 
-  DCHECK_IMPLIES(!value.InWritableSharedSpace() || is_shared_space_isolate_,
-                 !marking_state_.IsImpossible(value));
-
-  // Host may have an impossible markbit pattern if manual allocation folding
-  // is performed and host happens to be the last word of an allocated region.
-  // In that case host has only one markbit and the second markbit belongs to
-  // another object. We can detect that case by checking if value is a one word
-  // filler map.
-  DCHECK(!marking_state_.IsImpossible(host) ||
-         value == ReadOnlyRoots(heap_->isolate()).one_pointer_filler_map());
-
   // When shared heap isn't enabled all objects are local, we can just run the
   // local marking barrier. Also from the point-of-view of the shared space
   // isolate (= main isolate) also shared objects are considered local.
@@ -65,7 +54,7 @@ void MarkingBarrier::MarkValueShared(HeapObject value) {
   DCHECK(shared_heap_worklist_.has_value());
 
   // Mark shared object and push it onto shared heap worklist.
-  if (marking_state_.WhiteToGrey(value)) {
+  if (marking_state_.TryMark(value)) {
     shared_heap_worklist_->Push(value);
   }
 }
@@ -75,6 +64,9 @@ void MarkingBarrier::MarkValueLocal(HeapObject value) {
   if (is_minor()) {
     // We do not need to insert into RememberedSet<OLD_TO_NEW> here because the
     // C++ marking barrier already does this for us.
+    // TODO(v8:13012): Consider updating C++ barriers to respect
+    // POINTERS_TO_HERE_ARE_INTERESTING and POINTERS_FROM_HERE_ARE_INTERESTING
+    // page flags and make the following branch a DCHECK.
     if (Heap::InYoungGeneration(value)) {
       WhiteToGreyAndPush(value);  // NEW->NEW
     }
@@ -116,7 +108,7 @@ bool MarkingBarrier::IsCompacting(HeapObject object) const {
 }
 
 bool MarkingBarrier::WhiteToGreyAndPush(HeapObject obj) {
-  if (marking_state_.WhiteToGrey(obj)) {
+  if (marking_state_.TryMark(obj)) {
     current_worklist_->Push(obj);
     return true;
   }

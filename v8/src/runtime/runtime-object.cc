@@ -45,15 +45,6 @@ MaybeHandle<Object> Runtime::GetObjectProperty(
   }
   if (is_found) *is_found = it.IsFound();
 
-  if (!it.IsFound() && key->IsSymbol() &&
-      Symbol::cast(*key).is_private_name()) {
-    MessageTemplate message =
-        Symbol::cast(*key).IsPrivateBrand()
-            ? MessageTemplate::kInvalidPrivateBrandInstance
-            : MessageTemplate::kInvalidPrivateMemberRead;
-    THROW_NEW_ERROR(isolate, NewTypeError(message, key, lookup_start_object),
-                    Object);
-  }
   return result;
 }
 
@@ -77,8 +68,7 @@ MaybeHandle<Object> Runtime::HasProperty(Isolate* isolate,
   // Lookup the {name} on {receiver}.
   Maybe<bool> maybe = JSReceiver::HasProperty(isolate, receiver, name);
   if (maybe.IsNothing()) return MaybeHandle<Object>();
-  return maybe.FromJust() ? ReadOnlyRoots(isolate).true_value_handle()
-                          : ReadOnlyRoots(isolate).false_value_handle();
+  return ReadOnlyRoots(isolate).boolean_value_handle(maybe.FromJust());
 }
 
 namespace {
@@ -459,11 +449,16 @@ RUNTIME_FUNCTION(Runtime_AddDictionaryProperty) {
         receiver->property_dictionary_swiss(), isolate);
     dictionary = SwissNameDictionary::Add(isolate, dictionary, name, value,
                                           property_details);
+    // TODO(pthier): Add flags to swiss dictionaries and track interesting
+    // symbols.
     receiver->SetProperties(*dictionary);
   } else {
     Handle<NameDictionary> dictionary(receiver->property_dictionary(), isolate);
     dictionary =
         NameDictionary::Add(isolate, dictionary, name, value, property_details);
+    if (name->IsInteresting(isolate)) {
+      dictionary->set_may_have_interesting_properties(true);
+    }
     receiver->SetProperties(*dictionary);
   }
 
@@ -500,9 +495,15 @@ RUNTIME_FUNCTION(Runtime_AddPrivateBrand) {
         handle(Context::cast(context->get(Context::PREVIOUS_INDEX)), isolate);
   }
   DCHECK_EQ(context->scope_info().scope_type(), ScopeType::CLASS_SCOPE);
-  CHECK(Object::AddDataProperty(&it, context, attributes, Just(kDontThrow),
-                                StoreOrigin::kMaybeKeyed)
-            .FromJust());
+  Maybe<bool> added_brand = Object::AddDataProperty(
+      &it, context, attributes, Just(kThrowOnError), StoreOrigin::kMaybeKeyed);
+  // Objects in shared space are fixed shape, so private symbols cannot be
+  // added.
+  if (V8_UNLIKELY(receiver->IsAlwaysSharedSpaceJSObject())) {
+    CHECK(added_brand.IsNothing());
+    return ReadOnlyRoots(isolate).exception();
+  }
+  CHECK(added_brand.IsJust());
   return *receiver;
 }
 
@@ -812,7 +813,7 @@ RUNTIME_FUNCTION(Runtime_GetProperty) {
           PropertyCell cell = dictionary.CellAt(entry);
           if (cell.property_details().kind() == PropertyKind::kData) {
             Object value = cell.value();
-            if (!value.IsTheHole(isolate)) return value;
+            if (!value.IsPropertyCellHole(isolate)) return value;
             // If value is the hole (meaning, absent) do the general lookup.
           }
         }
@@ -1086,7 +1087,8 @@ RUNTIME_FUNCTION(Runtime_DefineAccessorPropertyUnchecked) {
   auto attrs = PropertyAttributesFromInt(args.smi_value_at(4));
 
   RETURN_FAILURE_ON_EXCEPTION(
-      isolate, JSObject::DefineAccessor(obj, name, getter, setter, attrs));
+      isolate, JSObject::DefineOwnAccessorIgnoreAttributes(obj, name, getter,
+                                                           setter, attrs));
   return ReadOnlyRoots(isolate).undefined_value();
 }
 
@@ -1213,8 +1215,8 @@ RUNTIME_FUNCTION(Runtime_DefineGetterPropertyUnchecked) {
 
   RETURN_FAILURE_ON_EXCEPTION(
       isolate,
-      JSObject::DefineAccessor(object, name, getter,
-                               isolate->factory()->null_value(), attrs));
+      JSObject::DefineOwnAccessorIgnoreAttributes(
+          object, name, getter, isolate->factory()->null_value(), attrs));
   return ReadOnlyRoots(isolate).undefined_value();
 }
 
@@ -1358,8 +1360,8 @@ RUNTIME_FUNCTION(Runtime_DefineSetterPropertyUnchecked) {
 
   RETURN_FAILURE_ON_EXCEPTION(
       isolate,
-      JSObject::DefineAccessor(object, name, isolate->factory()->null_value(),
-                               setter, attrs));
+      JSObject::DefineOwnAccessorIgnoreAttributes(
+          object, name, isolate->factory()->null_value(), setter, attrs));
   return ReadOnlyRoots(isolate).undefined_value();
 }
 

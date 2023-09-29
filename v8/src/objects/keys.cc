@@ -5,6 +5,7 @@
 #include "src/objects/keys.h"
 
 #include "src/api/api-arguments-inl.h"
+#include "src/api/api.h"
 #include "src/common/assert-scope.h"
 #include "src/common/globals.h"
 #include "src/execution/isolate-inl.h"
@@ -150,9 +151,8 @@ ExceptionStatus KeyAccumulator::AddKey(Handle<Object> key,
       OrderedHashSet::Add(isolate(), keys(), key);
   Handle<OrderedHashSet> new_set;
   if (!new_set_candidate.ToHandle(&new_set)) {
-    THROW_NEW_ERROR_RETURN_VALUE(
-        isolate_, NewRangeError(MessageTemplate::kTooManyProperties),
-        ExceptionStatus::kException);
+    CHECK(isolate_->has_pending_exception());
+    return ExceptionStatus::kException;
   }
   if (*new_set != *keys_) {
     // The keys_ Set is converted directly to a FixedArray in GetKeys which can
@@ -184,7 +184,8 @@ ExceptionStatus KeyAccumulator::AddKeys(Handle<JSObject> array_like,
 MaybeHandle<FixedArray> FilterProxyKeys(KeyAccumulator* accumulator,
                                         Handle<JSProxy> owner,
                                         Handle<FixedArray> keys,
-                                        PropertyFilter filter) {
+                                        PropertyFilter filter,
+                                        bool skip_indices) {
   if (filter == ALL_PROPERTIES) {
     // Nothing to do.
     return keys;
@@ -194,6 +195,10 @@ MaybeHandle<FixedArray> FilterProxyKeys(KeyAccumulator* accumulator,
   for (int i = 0; i < keys->length(); ++i) {
     Handle<Name> key(Name::cast(keys->get(i)), isolate);
     if (key->FilterKey(filter)) continue;  // Skip this key.
+    if (skip_indices) {
+      uint32_t index;
+      if (key->AsArrayIndex(&index)) continue;  // Skip this key.
+    }
     if (filter & ONLY_ENUMERABLE) {
       PropertyDescriptor desc;
       Maybe<bool> found =
@@ -220,7 +225,8 @@ Maybe<bool> KeyAccumulator::AddKeysFromJSProxy(Handle<JSProxy> proxy,
   // Postpone the enumerable check for for-in to the ForInFilter step.
   if (!is_for_in_) {
     ASSIGN_RETURN_ON_EXCEPTION_VALUE(
-        isolate_, keys, FilterProxyKeys(this, proxy, keys, filter_),
+        isolate_, keys,
+        FilterProxyKeys(this, proxy, keys, filter_, skip_indices_),
         Nothing<bool>());
   }
   // https://tc39.es/ecma262/#sec-proxy-object-internal-methods-and-internal-slots-ownpropertykeys
@@ -533,18 +539,18 @@ Handle<FixedArray> FastKeyAccumulator::InitializeFastPropertyEnumCache(
     indices = isolate->factory()->NewFixedArray(enum_length, allocation);
     index = 0;
     DisallowGarbageCollection no_gc;
-    auto raw_map = *map;
-    auto raw_indices = *indices;
-    auto raw_descriptors = *descriptors;
-    for (InternalIndex i : raw_map.IterateOwnDescriptors()) {
-      PropertyDetails details = raw_descriptors.GetDetails(i);
+    Tagged<Map> raw_map = *map;
+    Tagged<FixedArray> raw_indices = *indices;
+    Tagged<DescriptorArray> raw_descriptors = *descriptors;
+    for (InternalIndex i : raw_map->IterateOwnDescriptors()) {
+      PropertyDetails details = raw_descriptors->GetDetails(i);
       if (details.IsDontEnum()) continue;
-      Object key = raw_descriptors.GetKey(i);
+      Object key = raw_descriptors->GetKey(i);
       if (key.IsSymbol()) continue;
       DCHECK_EQ(PropertyKind::kData, details.kind());
       DCHECK_EQ(PropertyLocation::kField, details.location());
       FieldIndex field_index = FieldIndex::ForDetails(raw_map, details);
-      raw_indices.set(index, Smi::FromInt(field_index.GetLoadByFieldIndex()));
+      raw_indices->set(index, Smi::FromInt(field_index.GetLoadByFieldIndex()));
       index++;
     }
     DCHECK_EQ(index, indices->length());
@@ -658,7 +664,7 @@ bool FastKeyAccumulator::TryPrototypeInfoCache(Handle<JSReceiver> receiver) {
   if (!object->HasFastProperties()) return false;
   if (object->HasNamedInterceptor()) return false;
   if (object->IsAccessCheckNeeded() &&
-      !isolate_->MayAccess(handle(isolate_->context(), isolate_), object)) {
+      !isolate_->MayAccess(isolate_->native_context(), object)) {
     return false;
   }
   DisallowGarbageCollection no_gc;
@@ -693,7 +699,6 @@ KeyAccumulator::FilterForEnumerableProperties(
     // Query callbacks are not expected to have side effects.
     PropertyCallbackArguments args(isolate_, interceptor->data(), *receiver,
                                    *object, Just(kDontThrow));
-
     Handle<Object> element = accessor->Get(isolate_, result, entry);
     Handle<Object> attributes;
     if (type == kIndexed) {
@@ -1135,7 +1140,7 @@ Maybe<bool> KeyAccumulator::CollectOwnKeys(Handle<JSReceiver> receiver,
                                            Handle<JSObject> object) {
   // Check access rights if required.
   if (object->IsAccessCheckNeeded() &&
-      !isolate_->MayAccess(handle(isolate_->context(), isolate_), object)) {
+      !isolate_->MayAccess(isolate_->native_context(), object)) {
     // The cross-origin spec says that [[Enumerate]] shall return an empty
     // iterator when it doesn't have access...
     if (mode_ == KeyCollectionMode::kIncludePrototypes) {

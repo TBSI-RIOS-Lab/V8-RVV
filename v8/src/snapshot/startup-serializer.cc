@@ -5,7 +5,7 @@
 #include "src/snapshot/startup-serializer.h"
 
 #include "src/execution/v8threads.h"
-#include "src/handles/global-handles.h"
+#include "src/handles/global-handles-inl.h"
 #include "src/heap/heap-inl.h"
 #include "src/heap/read-only-heap.h"
 #include "src/objects/contexts.h"
@@ -62,10 +62,8 @@ class V8_NODISCARD SanitizeIsolateScope final {
 
 StartupSerializer::StartupSerializer(
     Isolate* isolate, Snapshot::SerializerFlags flags,
-    ReadOnlySerializer* read_only_serializer,
     SharedHeapSerializer* shared_heap_serializer)
     : RootsSerializer(isolate, flags, RootIndex::kFirstStrongRoot),
-      read_only_serializer_(read_only_serializer),
       shared_heap_serializer_(shared_heap_serializer),
       accessor_infos_(isolate->heap()),
       call_handler_infos_(isolate->heap()) {
@@ -82,23 +80,8 @@ StartupSerializer::~StartupSerializer() {
   OutputStatistics("StartupSerializer");
 }
 
-#ifdef DEBUG
-namespace {
-
-bool IsUnexpectedCodeObject(Isolate* isolate, HeapObject obj) {
-  if (!obj.IsInstructionStream()) return false;
-
-  InstructionStream code = InstructionStream::cast(obj);
-  if (code.kind() == CodeKind::REGEXP) return false;
-  if (!code.is_builtin()) return true;
-
-  // An on-heap builtin.
-  return true;
-}
-
-}  // namespace
-#endif  // DEBUG
-void StartupSerializer::SerializeObjectImpl(Handle<HeapObject> obj) {
+void StartupSerializer::SerializeObjectImpl(Handle<HeapObject> obj,
+                                            SlotType slot_type) {
   PtrComprCageBase cage_base(isolate());
 #ifdef DEBUG
   if (obj->IsJSFunction(cage_base)) {
@@ -113,12 +96,12 @@ void StartupSerializer::SerializeObjectImpl(Handle<HeapObject> obj) {
   {
     DisallowGarbageCollection no_gc;
     HeapObject raw = *obj;
-    DCHECK(!IsUnexpectedCodeObject(isolate(), raw));
+    DCHECK(!raw.IsInstructionStream());
     if (SerializeHotObject(raw)) return;
     if (IsRootAndHasBeenSerialized(raw) && SerializeRoot(raw)) return;
   }
 
-  if (SerializeUsingReadOnlyObjectCache(&sink_, obj)) return;
+  if (SerializeReadOnlyObjectReference(*obj, &sink_)) return;
   if (SerializeUsingSharedHeapObjectCache(&sink_, obj)) return;
   if (SerializeBackReference(*obj)) return;
 
@@ -149,7 +132,7 @@ void StartupSerializer::SerializeObjectImpl(Handle<HeapObject> obj) {
   // Object has not yet been serialized.  Serialize it here.
   DCHECK(!ReadOnlyHeap::Contains(*obj));
   ObjectSerializer object_serializer(this, obj, &sink_);
-  object_serializer.Serialize();
+  object_serializer.Serialize(slot_type);
 }
 
 void StartupSerializer::SerializeWeakReferencesAndDeferred() {
@@ -179,8 +162,8 @@ void StartupSerializer::SerializeStrongReferences(
   // the first page.
   isolate->heap()->IterateSmiRoots(this);
   isolate->heap()->IterateRoots(
-      this,
-      base::EnumSet<SkipRoot>{SkipRoot::kUnserializable, SkipRoot::kWeak});
+      this, base::EnumSet<SkipRoot>{SkipRoot::kUnserializable, SkipRoot::kWeak,
+                                    SkipRoot::kTracedHandles});
 }
 
 SerializedHandleChecker::SerializedHandleChecker(Isolate* isolate,
@@ -190,11 +173,6 @@ SerializedHandleChecker::SerializedHandleChecker(Isolate* isolate,
   for (auto const& context : *contexts) {
     AddToSet(context.serialized_objects());
   }
-}
-
-bool StartupSerializer::SerializeUsingReadOnlyObjectCache(
-    SnapshotByteSink* sink, Handle<HeapObject> obj) {
-  return read_only_serializer_->SerializeUsingReadOnlyObjectCache(sink, obj);
 }
 
 bool StartupSerializer::SerializeUsingSharedHeapObjectCache(
@@ -207,7 +185,7 @@ void StartupSerializer::SerializeUsingStartupObjectCache(
     SnapshotByteSink* sink, Handle<HeapObject> obj) {
   int cache_index = SerializeInObjectCache(obj);
   sink->Put(kStartupObjectCache, "StartupObjectCache");
-  sink->PutInt(cache_index, "startup_object_cache_index");
+  sink->PutUint30(cache_index, "startup_object_cache_index");
 }
 
 void StartupSerializer::CheckNoDirtyFinalizationRegistries() {

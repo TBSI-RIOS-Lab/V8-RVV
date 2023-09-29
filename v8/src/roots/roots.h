@@ -13,11 +13,13 @@
 #include "src/objects/objects-definitions.h"
 #include "src/objects/objects.h"
 #include "src/objects/slots.h"
+#include "src/objects/tagged.h"
 
 namespace v8 {
 namespace internal {
 
 // Forward declarations.
+class Boolean;
 enum ElementsKind : uint8_t;
 template <typename T>
 class Handle;
@@ -33,6 +35,8 @@ class ReadOnlyHeap;
 class RootVisitor;
 class String;
 class Symbol;
+template <typename T>
+class Tagged;
 
 #define STRONG_READ_ONLY_HEAP_NUMBER_ROOT_LIST(V)         \
   /* Special numbers */                                   \
@@ -64,11 +68,11 @@ class Symbol;
   V(Map, one_pointer_filler_map, OnePointerFillerMap)                          \
   V(Map, two_pointer_filler_map, TwoPointerFillerMap)                          \
   V(Oddball, uninitialized_value, UninitializedValue)                          \
-  V(Oddball, undefined_value, UndefinedValue)                                  \
-  V(Oddball, the_hole_value, TheHoleValue)                                     \
-  V(Oddball, null_value, NullValue)                                            \
-  V(Oddball, true_value, TrueValue)                                            \
-  V(Oddball, false_value, FalseValue)                                          \
+  V(Undefined, undefined_value, UndefinedValue)                                \
+  V(Hole, the_hole_value, TheHoleValue)                                        \
+  V(Null, null_value, NullValue)                                               \
+  V(True, true_value, TrueValue)                                               \
+  V(False, false_value, FalseValue)                                            \
   EXTRA_IMPORTANT_INTERNALIZED_STRING_ROOT_LIST(V)                             \
   V(Map, meta_map, MetaMap)                                                    \
   V(Map, byte_array_map, ByteArrayMap)                                         \
@@ -100,6 +104,8 @@ class Symbol;
   V(Oddball, termination_exception, TerminationException)                      \
   V(Oddball, optimized_out, OptimizedOut)                                      \
   V(Oddball, stale_register, StaleRegister)                                    \
+  /* Holes */                                                                  \
+  V(Hole, property_cell_hole_value, PropertyCellHoleValue)                     \
   /* Maps */                                                                   \
   V(Map, script_context_table_map, ScriptContextTableMap)                      \
   V(Map, closure_feedback_cell_array_map, ClosureFeedbackCellArrayMap)         \
@@ -129,8 +135,6 @@ class Symbol;
   V(Map, side_effect_call_handler_info_map, SideEffectCallHandlerInfoMap)      \
   V(Map, side_effect_free_call_handler_info_map,                               \
     SideEffectFreeCallHandlerInfoMap)                                          \
-  V(Map, next_call_side_effect_free_call_handler_info_map,                     \
-    NextCallSideEffectFreeCallHandlerInfoMap)                                  \
   V(Map, simple_number_dictionary_map, SimpleNumberDictionaryMap)              \
   V(Map, small_ordered_hash_map_map, SmallOrderedHashMapMap)                   \
   V(Map, small_ordered_hash_set_map, SmallOrderedHashSetMap)                   \
@@ -182,7 +186,7 @@ class Symbol;
   V(Map, shared_uncached_external_string_map, SharedUncachedExternalStringMap) \
   /* Oddball maps */                                                           \
   V(Map, undefined_map, UndefinedMap)                                          \
-  V(Map, the_hole_map, TheHoleMap)                                             \
+  V(Map, hole_map, HoleMap)                                                    \
   V(Map, null_map, NullMap)                                                    \
   V(Map, boolean_map, BooleanMap)                                              \
   V(Map, uninitialized_map, UninitializedMap)                                  \
@@ -193,6 +197,10 @@ class Symbol;
   V(Map, stale_register_map, StaleRegisterMap)                                 \
   V(Map, self_reference_marker_map, SelfReferenceMarkerMap)                    \
   V(Map, basic_block_counters_marker_map, BasicBlockCountersMarkerMap)         \
+  /* Shared space object maps */                                               \
+  V(Map, js_shared_array_map, JSSharedArrayMap)                                \
+  V(Map, js_atomics_mutex_map, JSAtomicsMutexMap)                              \
+  V(Map, js_atomics_condition_map, JSAtomicsConditionMap)                      \
   /* Canonical empty values */                                                 \
   V(EnumCache, empty_enum_cache, EmptyEnumCache)                               \
   V(PropertyArray, empty_property_array, EmptyPropertyArray)                   \
@@ -233,44 +241,8 @@ class Symbol;
   V(RegisteredSymbolTable, empty_symbol_table, EmptySymbolTable)               \
   /* Hash seed */                                                              \
   V(ByteArray, hash_seed, HashSeed)                                            \
-  IF_WASM(V, WasmNull, wasm_null, WasmNull)
-
-// Mutable roots that are known to be immortal immovable, for which we can
-// safely skip write barriers.
-#define STRONG_MUTABLE_IMMOVABLE_ROOT_LIST(V)                                  \
-  ACCESSOR_INFO_ROOT_LIST(V)                                                   \
-  /* Maps */                                                                   \
-  V(Map, external_map, ExternalMap)                                            \
-  V(Map, message_object_map, JSMessageObjectMap)                               \
-  /* Canonical empty values */                                                 \
-  V(Script, empty_script, EmptyScript)                                         \
-  V(FeedbackCell, many_closures_cell, ManyClosuresCell)                        \
-  /* Protectors */                                                             \
-  V(PropertyCell, array_constructor_protector, ArrayConstructorProtector)      \
-  V(PropertyCell, no_elements_protector, NoElementsProtector)                  \
-  V(PropertyCell, mega_dom_protector, MegaDOMProtector)                        \
-  V(PropertyCell, is_concat_spreadable_protector, IsConcatSpreadableProtector) \
-  V(PropertyCell, array_species_protector, ArraySpeciesProtector)              \
-  V(PropertyCell, typed_array_species_protector, TypedArraySpeciesProtector)   \
-  V(PropertyCell, promise_species_protector, PromiseSpeciesProtector)          \
-  V(PropertyCell, regexp_species_protector, RegExpSpeciesProtector)            \
-  V(PropertyCell, string_length_protector, StringLengthProtector)              \
-  V(PropertyCell, array_iterator_protector, ArrayIteratorProtector)            \
-  V(PropertyCell, array_buffer_detaching_protector,                            \
-    ArrayBufferDetachingProtector)                                             \
-  V(PropertyCell, promise_hook_protector, PromiseHookProtector)                \
-  V(PropertyCell, promise_resolve_protector, PromiseResolveProtector)          \
-  V(PropertyCell, map_iterator_protector, MapIteratorProtector)                \
-  V(PropertyCell, promise_then_protector, PromiseThenProtector)                \
-  V(PropertyCell, set_iterator_protector, SetIteratorProtector)                \
-  V(PropertyCell, string_iterator_protector, StringIteratorProtector)          \
-  V(PropertyCell, number_string_prototype_no_replace_protector,                \
-    NumberStringPrototypeNoReplaceProtector)                                   \
-  /* Caches */                                                                 \
-  V(FixedArray, string_split_cache, StringSplitCache)                          \
-  V(FixedArray, regexp_multiple_cache, RegExpMultipleCache)                    \
-  /* Indirection lists for isolate-independent builtins */                     \
-  V(FixedArray, builtins_constants_table, BuiltinsConstantsTable)              \
+  IF_WASM(V, HeapObject, wasm_null_padding, WasmNullPadding)                   \
+  IF_WASM(V, WasmNull, wasm_null, WasmNull)                                    \
   /* Internal SharedFunctionInfos */                                           \
   V(SharedFunctionInfo, async_function_await_reject_shared_fun,                \
     AsyncFunctionAwaitRejectSharedFun)                                         \
@@ -320,6 +292,44 @@ class Symbol;
   V(SharedFunctionInfo, source_text_module_execute_async_module_rejected_sfi,  \
     SourceTextModuleExecuteAsyncModuleRejectedSFI)
 
+// Mutable roots that are known to be immortal immovable, for which we can
+// safely skip write barriers.
+#define STRONG_MUTABLE_IMMOVABLE_ROOT_LIST(V)                                  \
+  ACCESSOR_INFO_ROOT_LIST(V)                                                   \
+  /* Maps */                                                                   \
+  V(Map, external_map, ExternalMap)                                            \
+  V(Map, message_object_map, JSMessageObjectMap)                               \
+  /* Canonical empty values */                                                 \
+  V(Script, empty_script, EmptyScript)                                         \
+  V(FeedbackCell, many_closures_cell, ManyClosuresCell)                        \
+  /* Protectors */                                                             \
+  V(PropertyCell, array_constructor_protector, ArrayConstructorProtector)      \
+  V(PropertyCell, no_elements_protector, NoElementsProtector)                  \
+  V(PropertyCell, mega_dom_protector, MegaDOMProtector)                        \
+  V(PropertyCell, no_profiling_protector, NoProfilingProtector)                \
+  V(PropertyCell, is_concat_spreadable_protector, IsConcatSpreadableProtector) \
+  V(PropertyCell, array_species_protector, ArraySpeciesProtector)              \
+  V(PropertyCell, typed_array_species_protector, TypedArraySpeciesProtector)   \
+  V(PropertyCell, promise_species_protector, PromiseSpeciesProtector)          \
+  V(PropertyCell, regexp_species_protector, RegExpSpeciesProtector)            \
+  V(PropertyCell, string_length_protector, StringLengthProtector)              \
+  V(PropertyCell, array_iterator_protector, ArrayIteratorProtector)            \
+  V(PropertyCell, array_buffer_detaching_protector,                            \
+    ArrayBufferDetachingProtector)                                             \
+  V(PropertyCell, promise_hook_protector, PromiseHookProtector)                \
+  V(PropertyCell, promise_resolve_protector, PromiseResolveProtector)          \
+  V(PropertyCell, map_iterator_protector, MapIteratorProtector)                \
+  V(PropertyCell, promise_then_protector, PromiseThenProtector)                \
+  V(PropertyCell, set_iterator_protector, SetIteratorProtector)                \
+  V(PropertyCell, string_iterator_protector, StringIteratorProtector)          \
+  V(PropertyCell, number_string_not_regexp_like_protector,                     \
+    NumberStringNotRegexpLikeProtector)                                        \
+  /* Caches */                                                                 \
+  V(FixedArray, string_split_cache, StringSplitCache)                          \
+  V(FixedArray, regexp_multiple_cache, RegExpMultipleCache)                    \
+  /* Indirection lists for isolate-independent builtins */                     \
+  V(FixedArray, builtins_constants_table, BuiltinsConstantsTable)
+
 // These root references can be updated by the mutator.
 #define STRONG_MUTABLE_MOVABLE_ROOT_LIST(V)                                 \
   /* Caches */                                                              \
@@ -351,7 +361,12 @@ class Symbol;
   IF_WASM(V, HeapObject, active_continuation, ActiveContinuation)           \
   IF_WASM(V, HeapObject, active_suspender, ActiveSuspender)                 \
   IF_WASM(V, WeakArrayList, js_to_wasm_wrappers, JSToWasmWrappers)          \
-  IF_WASM(V, WeakArrayList, wasm_canonical_rtts, WasmCanonicalRtts)
+  IF_WASM(V, WeakArrayList, wasm_canonical_rtts, WasmCanonicalRtts)         \
+  /* Internal SharedFunctionInfos */                                        \
+  V(FunctionTemplateInfo, error_stack_getter_fun_template,                  \
+    ErrorStackGetterSharedFun)                                              \
+  V(FunctionTemplateInfo, error_stack_setter_fun_template,                  \
+    ErrorStackSetterSharedFun)
 
 // Entries in this list are limited to Smis and are not visited during GC.
 #define SMI_ROOT_LIST(V)                                                       \
@@ -412,9 +427,9 @@ class Symbol;
   NAME_FOR_PROTECTOR_ROOT_LIST(V)  \
   DATA_HANDLER_MAPS_LIST(V)
 
-#define MUTABLE_ROOT_LIST(V)                \
-  STRONG_MUTABLE_IMMOVABLE_ROOT_LIST(V)     \
-  STRONG_MUTABLE_MOVABLE_ROOT_LIST(V)       \
+#define MUTABLE_ROOT_LIST(V)            \
+  STRONG_MUTABLE_IMMOVABLE_ROOT_LIST(V) \
+  STRONG_MUTABLE_MOVABLE_ROOT_LIST(V)   \
   SMI_ROOT_LIST(V)
 
 #define ROOT_LIST(V)     \
@@ -444,6 +459,10 @@ enum class RootIndex : uint16_t {
 
   kFirstHeapNumberRoot = kNanValue,
   kLastHeapNumberRoot = kSmiMaxValuePlusOne,
+
+  // Keep this in sync with the first map allocated by
+  // Heap::CreateLateReadOnlyJSReceiverMaps.
+  kFirstJSReceiverMapRoot = kJSSharedArrayMap,
 
   // Use for fast protector update checks
   kFirstNameForProtector = kconstructor_string,
@@ -607,6 +626,10 @@ class RootsTable {
   friend class SoleReadOnlyHeap;
 };
 
+#define ROOT_TYPE_FWD_DECL(Type, name, CamelName) class Type;
+READ_ONLY_ROOT_LIST(ROOT_TYPE_FWD_DECL)
+#undef ROOT_TYPE_FWD_DECL
+
 class ReadOnlyRoots {
  public:
   static constexpr size_t kEntriesCount =
@@ -620,9 +643,9 @@ class ReadOnlyRoots {
   // map-word instead of a tagged heap pointer.
   MapWord one_pointer_filler_map_word();
 
-#define ROOT_ACCESSOR(Type, name, CamelName)     \
-  V8_INLINE class Type name() const;             \
-  V8_INLINE class Type unchecked_##name() const; \
+#define ROOT_ACCESSOR(Type, name, CamelName)       \
+  V8_INLINE Tagged<Type> name() const;             \
+  V8_INLINE Tagged<Type> unchecked_##name() const; \
   V8_INLINE Handle<Type> name##_handle() const;
 
   READ_ONLY_ROOT_LIST(ROOT_ACCESSOR)
@@ -634,12 +657,15 @@ class ReadOnlyRoots {
   void VerifyNameForProtectors();
 #endif
 
+  V8_INLINE Tagged<Boolean> boolean_value(bool value) const;
+  V8_INLINE Handle<Boolean> boolean_value_handle(bool value) const;
+
   // Returns heap number with identical value if it already exists or the empty
   // handle otherwise.
   Handle<HeapNumber> FindHeapNumber(double value);
 
   V8_INLINE Address address_at(RootIndex root_index) const;
-  V8_INLINE Object object_at(RootIndex root_index) const;
+  V8_INLINE Tagged<Object> object_at(RootIndex root_index) const;
   V8_INLINE Handle<Object> handle_at(RootIndex root_index) const;
 
   // Check if a slot is initialized yet. Should only be neccessary for code
@@ -675,6 +701,7 @@ class ReadOnlyRoots {
 
   friend class ReadOnlyHeap;
   friend class DeserializerAllocator;
+  friend class ReadOnlyHeapImageDeserializer;
 };
 
 }  // namespace internal

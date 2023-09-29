@@ -21,20 +21,25 @@ struct PtrComprCageReservationParams
   PtrComprCageReservationParams() {
     page_allocator = GetPlatformPageAllocator();
 
-    // Unused.
-    // TODO(v8:13788): Remove base_bias_size.
-    const size_t kIsolateRootBiasPageSize = 0;
-    reservation_size = kPtrComprCageReservationSize + kIsolateRootBiasPageSize;
+    reservation_size = kPtrComprCageReservationSize;
     base_alignment = kPtrComprCageBaseAlignment;
-    base_bias_size = kIsolateRootBiasPageSize;
 
     // Simplify BoundedPageAllocator's life by configuring it to use same page
     // size as the Heap will use (MemoryChunk::kPageSize).
     page_size =
         RoundUp(size_t{1} << kPageSizeBits, page_allocator->AllocatePageSize());
-    requested_start_hint =
-        reinterpret_cast<Address>(page_allocator->GetRandomMmapAddr());
+    requested_start_hint = RoundDown(
+        reinterpret_cast<Address>(page_allocator->GetRandomMmapAddr()),
+        base_alignment);
+
+#if V8_OS_FUCHSIA && !V8_EXTERNAL_CODE_SPACE
+    // If external code space is not enabled then executable pages (e.g. copied
+    // builtins, and JIT pages) will fall under the pointer compression range.
+    // Under Fuchsia that means the entire range must be allocated as JITtable.
+    jit = JitPermission::kMapAsJittable;
+#else
     jit = JitPermission::kNoJit;
+#endif
   }
 };
 #endif  // V8_COMPRESS_POINTERS

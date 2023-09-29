@@ -6,6 +6,7 @@
 
 #include "include/v8-fast-api-calls.h"
 #include "src/api/api-inl.h"
+#include "src/base/bits.h"
 #include "src/base/ieee754.h"
 #include "src/codegen/cpu-features.h"
 #include "src/common/globals.h"
@@ -247,6 +248,17 @@ ExternalReference::shared_external_pointer_table_address_address(
   return ExternalReference(
       isolate->shared_external_pointer_table_address_address());
 }
+
+ExternalReference ExternalReference::code_pointer_table_address() {
+  // TODO(saelo) remove this ifdef when merging V8_CODE_POINTER_SANDBOXING into
+  // V8_ENABLE_SANDBOX
+#ifdef V8_CODE_POINTER_SANDBOXING
+  return ExternalReference(GetProcessWideCodePointerTable()->base_address());
+#else
+  return ExternalReference(kNullAddress);
+#endif
+}
+
 #endif  // V8_ENABLE_SANDBOX
 
 ExternalReference ExternalReference::interpreter_dispatch_table_address(
@@ -348,6 +360,29 @@ FUNCTION_REFERENCE(shared_barrier_from_code_function,
 FUNCTION_REFERENCE(insert_remembered_set_function,
                    Heap::InsertIntoRememberedSetFromCode)
 
+namespace {
+
+intptr_t DebugBreakAtEntry(Isolate* isolate, Address raw_sfi) {
+  DisallowGarbageCollection no_gc;
+  SharedFunctionInfo sfi = SharedFunctionInfo::cast(Object(raw_sfi));
+  return isolate->debug()->BreakAtEntry(sfi) ? 1 : 0;
+}
+
+Address DebugGetCoverageInfo(Isolate* isolate, Address raw_sfi) {
+  DisallowGarbageCollection no_gc;
+  SharedFunctionInfo sfi = SharedFunctionInfo::cast(Object(raw_sfi));
+  base::Optional<DebugInfo> debug_info = isolate->debug()->TryGetDebugInfo(sfi);
+  if (debug_info.has_value() && debug_info->HasCoverageInfo()) {
+    return debug_info->coverage_info().ptr();
+  }
+  return Smi::zero().ptr();
+}
+
+}  // namespace
+
+FUNCTION_REFERENCE(debug_break_at_entry_function, DebugBreakAtEntry)
+FUNCTION_REFERENCE(debug_get_coverage_info_function, DebugGetCoverageInfo)
+
 FUNCTION_REFERENCE(delete_handle_scope_extensions,
                    HandleScope::DeleteExtensions)
 
@@ -358,7 +393,8 @@ ExternalPointerHandle AllocateAndInitializeExternalPointerTableEntry(
     Isolate* isolate, Address pointer) {
 #ifdef V8_ENABLE_SANDBOX
   return isolate->external_pointer_table().AllocateAndInitializeEntry(
-      isolate, pointer, kExternalObjectValueTag);
+      isolate->heap()->external_pointer_space(), pointer,
+      kExternalObjectValueTag);
 #else
   return 0;
 #endif  // V8_ENABLE_SANDBOX
@@ -473,6 +509,8 @@ IF_WASM(FUNCTION_REFERENCE, wasm_call_trap_callback_for_testing,
         wasm::call_trap_callback_for_testing)
 IF_WASM(FUNCTION_REFERENCE, wasm_array_copy, wasm::array_copy_wrapper)
 IF_WASM(FUNCTION_REFERENCE, wasm_array_fill, wasm::array_fill_wrapper)
+IF_WASM(FUNCTION_REFERENCE_WITH_TYPE, wasm_string_to_f64,
+        wasm::flat_string_to_f64, BUILTIN_FP_POINTER_CALL)
 
 static void f64_acos_wrapper(Address data) {
   double input = ReadUnalignedValue<double>(data);
@@ -508,6 +546,15 @@ ExternalReference ExternalReference::allocation_sites_list_address(
 
 ExternalReference ExternalReference::address_of_jslimit(Isolate* isolate) {
   Address address = isolate->stack_guard()->address_of_jslimit();
+  // For efficient generated code, this should be root-register-addressable.
+  DCHECK(isolate->root_register_addressable_region().contains(address));
+  return ExternalReference(address);
+}
+
+ExternalReference ExternalReference::address_of_no_heap_write_interrupt_request(
+    Isolate* isolate) {
+  Address address = isolate->stack_guard()->address_of_interrupt_request(
+      StackGuard::InterruptLevel::kNoHeapWrites);
   // For efficient generated code, this should be root-register-addressable.
   DCHECK(isolate->root_register_addressable_region().contains(address));
   return ExternalReference(address);
@@ -612,11 +659,6 @@ ExternalReference::address_of_FLAG_harmony_regexp_unicode_sets() {
 // called address_of_FLAG_foo (easier grep-ability).
 ExternalReference ExternalReference::address_of_log_or_trace_osr() {
   return ExternalReference(&v8_flags.log_or_trace_osr);
-}
-
-ExternalReference
-ExternalReference::address_of_FLAG_harmony_symbol_as_weakmap_key() {
-  return ExternalReference(&v8_flags.harmony_symbol_as_weakmap_key);
 }
 
 ExternalReference ExternalReference::address_of_builtin_subclassing_flag() {
@@ -748,7 +790,7 @@ namespace {
 static uintptr_t BaselinePCForBytecodeOffset(Address raw_code_obj,
                                              int bytecode_offset,
                                              Address raw_bytecode_array) {
-  InstructionStream code_obj = InstructionStream::cast(Object(raw_code_obj));
+  Code code_obj = Code::cast(Object(raw_code_obj));
   BytecodeArray bytecode_array =
       BytecodeArray::cast(Object(raw_bytecode_array));
   return code_obj.GetBaselineStartPCForBytecodeOffset(bytecode_offset,
@@ -758,7 +800,7 @@ static uintptr_t BaselinePCForBytecodeOffset(Address raw_code_obj,
 static uintptr_t BaselinePCForNextExecutedBytecode(Address raw_code_obj,
                                                    int bytecode_offset,
                                                    Address raw_bytecode_array) {
-  InstructionStream code_obj = InstructionStream::cast(Object(raw_code_obj));
+  Code code_obj = Code::cast(Object(raw_code_obj));
   BytecodeArray bytecode_array =
       BytecodeArray::cast(Object(raw_bytecode_array));
   return code_obj.GetBaselinePCForNextExecutedBytecode(bytecode_offset,
@@ -776,16 +818,36 @@ ExternalReference ExternalReference::thread_in_wasm_flag_address_address(
   return ExternalReference(isolate->thread_in_wasm_flag_address_address());
 }
 
-ExternalReference ExternalReference::invoke_function_callback() {
-  Address thunk_address = FUNCTION_ADDR(&InvokeFunctionCallback);
-  ExternalReference::Type thunk_type = ExternalReference::PROFILING_API_CALL;
+ExternalReference ExternalReference::invoke_function_callback_generic() {
+  Address thunk_address = FUNCTION_ADDR(&InvokeFunctionCallbackGeneric);
+  ExternalReference::Type thunk_type = ExternalReference::DIRECT_API_CALL;
   ApiFunction thunk_fun(thunk_address);
   return ExternalReference::Create(&thunk_fun, thunk_type);
 }
 
+ExternalReference ExternalReference::invoke_function_callback_optimized() {
+  Address thunk_address = FUNCTION_ADDR(&InvokeFunctionCallbackOptimized);
+  ExternalReference::Type thunk_type = ExternalReference::DIRECT_API_CALL;
+  ApiFunction thunk_fun(thunk_address);
+  return ExternalReference::Create(&thunk_fun, thunk_type);
+}
+
+// static
+ExternalReference ExternalReference::invoke_function_callback(
+    CallApiCallbackMode mode) {
+  switch (mode) {
+    case CallApiCallbackMode::kGeneric:
+      return invoke_function_callback_generic();
+    case CallApiCallbackMode::kOptimized:
+      return invoke_function_callback_optimized();
+    case CallApiCallbackMode::kOptimizedNoProfiling:
+      return ExternalReference();
+  }
+}
+
 ExternalReference ExternalReference::invoke_accessor_getter_callback() {
   Address thunk_address = FUNCTION_ADDR(&InvokeAccessorGetterCallback);
-  ExternalReference::Type thunk_type = ExternalReference::PROFILING_GETTER_CALL;
+  ExternalReference::Type thunk_type = ExternalReference::DIRECT_GETTER_CALL;
   ApiFunction thunk_fun(thunk_address);
   return ExternalReference::Create(&thunk_fun, thunk_type);
 }
@@ -948,7 +1010,7 @@ void* libc_memmove(void* dest, const void* src, size_t n) {
 FUNCTION_REFERENCE(libc_memmove_function, libc_memmove)
 
 void* libc_memset(void* dest, int value, size_t n) {
-  DCHECK_EQ(static_cast<byte>(value), value);
+  DCHECK_EQ(static_cast<uint8_t>(value), value);
   return memset(dest, value, n);
 }
 
@@ -1302,11 +1364,6 @@ ExternalReference ExternalReference::async_event_delegate_address(
   return ExternalReference(isolate->async_event_delegate_address());
 }
 
-ExternalReference ExternalReference::debug_execution_mode_address(
-    Isolate* isolate) {
-  return ExternalReference(isolate->debug_execution_mode_address());
-}
-
 ExternalReference ExternalReference::debug_is_active_address(Isolate* isolate) {
   return ExternalReference(isolate->debug()->is_active_address());
 }
@@ -1358,18 +1415,29 @@ ExternalReference ExternalReference::fast_api_call_target_address(
       isolate->isolate_data()->fast_api_call_target_address());
 }
 
+ExternalReference ExternalReference::api_callback_thunk_argument_address(
+    Isolate* isolate) {
+  return ExternalReference(
+      isolate->isolate_data()->api_callback_thunk_argument_address());
+}
+
 ExternalReference ExternalReference::stack_is_iterable_address(
     Isolate* isolate) {
   return ExternalReference(
       isolate->isolate_data()->stack_is_iterable_address());
 }
 
-ExternalReference ExternalReference::is_profiling_address(Isolate* isolate) {
-  return ExternalReference(isolate->isolate_data()->is_profiling_address());
+ExternalReference ExternalReference::execution_mode_address(Isolate* isolate) {
+  return ExternalReference(isolate->isolate_data()->execution_mode_address());
 }
 
 FUNCTION_REFERENCE(call_enqueue_microtask_function,
                    MicrotaskQueue::CallEnqueueMicrotask)
+
+ExternalReference ExternalReference::int64_mul_high_function() {
+  return ExternalReference(
+      Redirect(FUNCTION_ADDR(base::bits::SignedMulHigh64)));
+}
 
 static int64_t atomic_pair_load(intptr_t address) {
   return std::atomic_load(reinterpret_cast<std::atomic<int64_t>*>(address));
@@ -1601,7 +1669,7 @@ IF_TSAN(FUNCTION_REFERENCE, tsan_relaxed_load_function_64_bits,
 
 static int EnterMicrotaskContextWrapper(HandleScopeImplementer* hsi,
                                         Address raw_context) {
-  Context context = Context::cast(Object(raw_context));
+  NativeContext context = NativeContext::cast(Object(raw_context));
   hsi->EnterMicrotaskContext(context);
   return 0;
 }

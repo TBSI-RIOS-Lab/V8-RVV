@@ -135,13 +135,16 @@ Type::bitset Type::BitsetLub() const {
   }
   if (IsRange()) return AsRange()->Lub();
   if (IsTuple()) return BitsetType::kOtherInternal;
+#if V8_ENABLE_WEBASSEMBLY
+  if (IsWasm()) return static_cast<const WasmType*>(ToTypeBase())->Lub();
+#endif
   UNREACHABLE();
 }
 
 // TODO(neis): Once the broker mode kDisabled is gone, change the input type to
 // MapRef and get rid of the HeapObjectType class.
 template <typename MapRefLike>
-Type::bitset BitsetType::Lub(const MapRefLike& map, JSHeapBroker* broker) {
+Type::bitset BitsetType::Lub(MapRefLike map, JSHeapBroker* broker) {
   switch (map.instance_type()) {
     case CONS_STRING_TYPE:
     case CONS_ONE_BYTE_STRING_TYPE:
@@ -154,6 +157,12 @@ Type::bitset BitsetType::Lub(const MapRefLike& map, JSHeapBroker* broker) {
     case UNCACHED_EXTERNAL_ONE_BYTE_STRING_TYPE:
     case STRING_TYPE:
     case ONE_BYTE_STRING_TYPE:
+    case SHARED_STRING_TYPE:
+    case SHARED_EXTERNAL_STRING_TYPE:
+    case SHARED_ONE_BYTE_STRING_TYPE:
+    case SHARED_EXTERNAL_ONE_BYTE_STRING_TYPE:
+    case SHARED_UNCACHED_EXTERNAL_STRING_TYPE:
+    case SHARED_UNCACHED_EXTERNAL_ONE_BYTE_STRING_TYPE:
       return kString;
     case EXTERNAL_INTERNALIZED_STRING_TYPE:
     case EXTERNAL_ONE_BYTE_INTERNALIZED_STRING_TYPE:
@@ -170,8 +179,6 @@ Type::bitset BitsetType::Lub(const MapRefLike& map, JSHeapBroker* broker) {
       switch (map.oddball_type(broker)) {
         case OddballType::kNone:
           break;
-        case OddballType::kHole:
-          return kHole;
         case OddballType::kBoolean:
           return kBoolean;
         case OddballType::kNull:
@@ -183,6 +190,10 @@ Type::bitset BitsetType::Lub(const MapRefLike& map, JSHeapBroker* broker) {
           // TODO(neis): We should add a kOtherOddball type.
           return kOtherInternal;
       }
+      UNREACHABLE();
+    case HOLE_TYPE:
+      // Holes have a single map and we should have distinguished them earlier
+      // by pointer comparison on the value.
       UNREACHABLE();
     case HEAP_NUMBER_TYPE:
       return kNumber;
@@ -260,6 +271,8 @@ Type::bitset BitsetType::Lub(const MapRefLike& map, JSHeapBroker* broker) {
     case JS_ITERATOR_MAP_HELPER_TYPE:
     case JS_ITERATOR_FILTER_HELPER_TYPE:
     case JS_ITERATOR_TAKE_HELPER_TYPE:
+    case JS_ITERATOR_DROP_HELPER_TYPE:
+    case JS_ITERATOR_FLAT_MAP_HELPER_TYPE:
     case JS_VALID_ITERATOR_WRAPPER_TYPE:
     case JS_FINALIZATION_REGISTRY_TYPE:
     case JS_WEAK_MAP_TYPE:
@@ -397,8 +410,7 @@ Type::bitset BitsetType::Lub(const MapRefLike& map, JSHeapBroker* broker) {
 }
 
 // Explicit instantiation.
-template Type::bitset BitsetType::Lub<MapRef>(const MapRef& map,
-                                              JSHeapBroker* broker);
+template Type::bitset BitsetType::Lub<MapRef>(MapRef map, JSHeapBroker* broker);
 
 Type::bitset BitsetType::Lub(double value) {
   DisallowGarbageCollection no_gc;
@@ -514,7 +526,7 @@ bool OtherNumberConstantType::IsOtherNumberConstant(double value) {
 }
 
 HeapConstantType::HeapConstantType(BitsetType::bitset bitset,
-                                   const HeapObjectRef& heap_ref)
+                                   HeapObjectRef heap_ref)
     : TypeBase(kHeapConstant), bitset_(bitset), heap_ref_(heap_ref) {}
 
 Handle<HeapObject> HeapConstantType::Value() const {
@@ -907,6 +919,14 @@ Type Type::Constant(JSHeapBroker* broker, ObjectRef ref, Zone* zone) {
   if (ref.IsString() && !ref.IsInternalizedString()) {
     return Type::String();
   }
+  switch (ref.HoleType()) {
+    case HoleType::kNone:
+      break;
+    case HoleType::kGeneric:
+      return Type::TheHole();
+    case HoleType::kPropertyCell:
+      return Type::PropertyCellHole();
+  }
   return HeapConstant(ref.AsHeapObject(), broker, zone);
 }
 
@@ -1145,9 +1165,9 @@ Type Type::OtherNumberConstant(double value, Zone* zone) {
 }
 
 // static
-Type Type::HeapConstant(const HeapObjectRef& value, JSHeapBroker* broker,
-                        Zone* zone) {
+Type Type::HeapConstant(HeapObjectRef value, JSHeapBroker* broker, Zone* zone) {
   DCHECK(!value.IsHeapNumber());
+  DCHECK_EQ(value.HoleType(), HoleType::kNone);
   DCHECK_IMPLIES(value.IsString(), value.IsInternalizedString());
   BitsetType::bitset bitset =
       BitsetType::Lub(value.GetHeapObjectType(broker), broker);

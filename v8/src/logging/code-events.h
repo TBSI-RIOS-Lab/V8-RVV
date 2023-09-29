@@ -10,7 +10,9 @@
 #include "src/base/platform/mutex.h"
 #include "src/base/vector.h"
 #include "src/common/globals.h"
+#include "src/objects/bytecode-array.h"
 #include "src/objects/code.h"
+#include "src/objects/instruction-stream.h"
 #include "src/objects/name.h"
 #include "src/objects/shared-function-info.h"
 #include "src/objects/string.h"
@@ -95,12 +97,11 @@ class LogEventListener {
   virtual void CodeMovingGCEvent() = 0;
   virtual void CodeDisableOptEvent(Handle<AbstractCode> code,
                                    Handle<SharedFunctionInfo> shared) = 0;
-  virtual void CodeDeoptEvent(Handle<InstructionStream> code,
-                              DeoptimizeKind kind, Address pc,
-                              int fp_to_sp_delta) = 0;
+  virtual void CodeDeoptEvent(Handle<Code> code, DeoptimizeKind kind,
+                              Address pc, int fp_to_sp_delta) = 0;
   // These events can happen when 1. an assumption made by optimized code fails
   // or 2. a weakly embedded object dies.
-  virtual void CodeDependencyChangeEvent(Handle<InstructionStream> code,
+  virtual void CodeDependencyChangeEvent(Handle<Code> code,
                                          Handle<SharedFunctionInfo> shared,
                                          const char* reason) = 0;
   // Called during GC shortly after any weak references to code objects are
@@ -108,6 +109,7 @@ class LogEventListener {
   virtual void WeakCodeClearEvent() = 0;
 
   virtual bool is_listening_to_code_events() { return false; }
+  virtual bool allows_code_compaction() { return true; }
 };
 
 // Dispatches code events to a set of registered listeners.
@@ -140,6 +142,13 @@ class Logger {
       if (listener->is_listening_to_code_events()) return true;
     }
     return false;
+  }
+
+  bool allows_code_compaction() const {
+    for (auto listener : listeners_) {
+      if (!listener->allows_code_compaction()) return false;
+    }
+    return true;
   }
 
   void CodeCreateEvent(CodeTag tag, Handle<AbstractCode> code,
@@ -243,14 +252,14 @@ class Logger {
       listener->CodeDisableOptEvent(code, shared);
     }
   }
-  void CodeDeoptEvent(Handle<InstructionStream> code, DeoptimizeKind kind,
-                      Address pc, int fp_to_sp_delta) {
+  void CodeDeoptEvent(Handle<Code> code, DeoptimizeKind kind, Address pc,
+                      int fp_to_sp_delta) {
     base::MutexGuard guard(&mutex_);
     for (auto listener : listeners_) {
       listener->CodeDeoptEvent(code, kind, pc, fp_to_sp_delta);
     }
   }
-  void CodeDependencyChangeEvent(Handle<InstructionStream> code,
+  void CodeDependencyChangeEvent(Handle<Code> code,
                                  Handle<SharedFunctionInfo> sfi,
                                  const char* reason) {
     base::MutexGuard guard(&mutex_);

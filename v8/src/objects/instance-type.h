@@ -5,12 +5,12 @@
 #ifndef V8_OBJECTS_INSTANCE_TYPE_H_
 #define V8_OBJECTS_INSTANCE_TYPE_H_
 
-#include "src/objects/elements-kind.h"
+#include "include/v8-internal.h"
 #include "src/objects/objects-definitions.h"
+#include "torque-generated/instance-types.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
-#include "torque-generated/instance-types.h"
 
 namespace v8 {
 namespace internal {
@@ -257,39 +257,6 @@ static_assert(LAST_TYPE < 1 << 15);
 
 V8_EXPORT_PRIVATE std::ostream& operator<<(std::ostream& os,
                                            InstanceType instance_type);
-
-// List of object types that have a single unique instance type.
-#define INSTANCE_TYPE_CHECKERS_SINGLE(V)           \
-  TORQUE_INSTANCE_CHECKERS_SINGLE_FULLY_DEFINED(V) \
-  TORQUE_INSTANCE_CHECKERS_SINGLE_ONLY_DECLARED(V) \
-  V(BigInt, BIGINT_TYPE)                           \
-  V(FixedArrayExact, FIXED_ARRAY_TYPE)
-
-#define INSTANCE_TYPE_CHECKERS_RANGE(V)           \
-  TORQUE_INSTANCE_CHECKERS_RANGE_FULLY_DEFINED(V) \
-  TORQUE_INSTANCE_CHECKERS_RANGE_ONLY_DECLARED(V)
-
-#define INSTANCE_TYPE_CHECKERS_CUSTOM(V) \
-  V(AbstractCode)                        \
-  V(ExternalString)                      \
-  V(FreeSpaceOrFiller)                   \
-  V(GcSafeCode)                          \
-  V(InternalizedString)
-
-#define INSTANCE_TYPE_CHECKERS(V)  \
-  INSTANCE_TYPE_CHECKERS_SINGLE(V) \
-  INSTANCE_TYPE_CHECKERS_RANGE(V)  \
-  INSTANCE_TYPE_CHECKERS_CUSTOM(V)
-
-namespace InstanceTypeChecker {
-#define IS_TYPE_FUNCTION_DECL(Type, ...)                         \
-  V8_INLINE constexpr bool Is##Type(InstanceType instance_type); \
-  V8_INLINE bool Is##Type(Map map);
-
-INSTANCE_TYPE_CHECKERS(IS_TYPE_FUNCTION_DECL)
-
-#undef IS_TYPE_FUNCTION_DECL
-}  // namespace InstanceTypeChecker
 
 // This list must contain only maps that are shared by all objects of their
 // instance type AND respective object must not represent a parent class for
