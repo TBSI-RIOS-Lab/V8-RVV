@@ -51,7 +51,8 @@ enum class MachineRepresentation : uint8_t {
   kSimd128,
   kSimd256,
   kFirstFPRepresentation = kFloat32,
-  kLastRepresentation = kSimd256
+  kLastRepresentation = kSimd256,
+  kSimdv
 };
 
 bool IsSubtype(MachineRepresentation rep1, MachineRepresentation rep2);
