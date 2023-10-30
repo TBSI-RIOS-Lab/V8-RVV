@@ -3832,6 +3832,16 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
                  i.InputSimd128Register(1));
       break;
     }
+    case kRiscvRvvStV: {
+      (__ VU).set(kScratchReg, VSew::E64, Vlmul::mf8);
+      auto memOperand = i.MemoryOperand(1);
+      Register dst = memOperand.offset() == 0 ? memOperand.rm() : kScratchReg;
+      if (memOperand.offset() != 0) {
+        __ AddWord(dst, memOperand.rm(), memOperand.offset());
+      }
+      __ vs(i.InputSimd128Register(0), dst, 0, VSew::E64);
+      break;
+    }
     default:
 #ifdef DEBUG
       switch (arch_opcode) {

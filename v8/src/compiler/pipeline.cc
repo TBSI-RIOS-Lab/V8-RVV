@@ -136,9 +136,12 @@
 #include "src/wasm/wasm-engine.h"
 #endif  // V8_ENABLE_WEBASSEMBLY
 
+/*
 #if V8_ENABLE_WASM_SIMD256_REVEC
 #include "src/compiler/revectorizer.h"
 #endif  // V8_ENABLE_WASM_SIMD256_REVEC
+*/
+#include "src/compiler/kvectorizer.h"
 
 namespace v8 {
 namespace internal {
@@ -758,11 +761,13 @@ class PipelineImpl final {
   void ComputeScheduledGraph();
   turboshaft::PipelineData CreateTurboshaftPipeline();
 
+/*
 #if V8_ENABLE_WASM_SIMD256_REVEC
   void Revectorize();
 #endif  // V8_ENABLE_WASM_SIMD256_REVEC
-
-  // Substep B.2.turbofan Select instructions from a scheduled graph.
+*/
+  void KVectorize();
+  // Substep B.2. Select instructions from a scheduled graph.
   bool SelectInstructions(Linkage* linkage);
 
   // Substep B.2.turboshaft Select instructions from a turboshaft graph.
@@ -2416,6 +2421,7 @@ struct ComputeSchedulePhase {
   }
 };
 
+/*
 #if V8_ENABLE_WASM_SIMD256_REVEC
 struct RevectorizePhase {
   DECL_PIPELINE_PHASE_CONSTANTS(Revectorizer)
@@ -2426,6 +2432,29 @@ struct RevectorizePhase {
   }
 };
 #endif  // V8_ENABLE_WASM_SIMD256_REVEC
+*/
+
+
+struct KVectorizePhase {
+  DECL_PIPELINE_PHASE_CONSTANTS(Revectorizer)
+
+  void Run(PipelineData* data, Zone* temp_zone) {
+    KVectorizer revec(temp_zone, data->graph(), data->mcgraph());
+    revec.TryRevectorize(data->info()->GetDebugName().get());
+  }
+};
+
+
+
+struct KVectorizePhase {
+  DECL_PIPELINE_PHASE_CONSTANTS(Revectorizer)
+
+  void Run(PipelineData* data, Zone* temp_zone) {
+    KVectorizer revec(temp_zone, data->graph(), data->mcgraph());
+    revec.TryRevectorize(data->info()->GetDebugName().get());
+  }
+};
+
 
 struct InstructionSelectionPhase {
   DECL_PIPELINE_PHASE_CONSTANTS(SelectInstructions)
@@ -3539,13 +3568,22 @@ void Pipeline::GenerateCodeForWasmFunction(
 
   pipeline.RunPrintAndVerify("V8.WasmMachineCode", true);
 
+/*
 #if V8_ENABLE_WASM_SIMD256_REVEC
   if (v8_flags.experimental_wasm_revectorize) {
     pipeline.Revectorize();
     pipeline.RunPrintAndVerify("V8.WasmRevec", true);
   }
 #endif  // V8_ENABLE_WASM_SIMD256_REVEC
+*/
 
+  pipeline.kVectorize();
+  pipeline.RunPrintAndVerify("V8.WasmKVec", true);
+
+  if (v8_flags.experimental_wasm_revectorize) {
+    pipeline.kVectorize();
+    pipeline.RunPrintAndVerify("V8.WasmRevec", true);
+  }
   data.BeginPhaseKind("V8.WasmOptimization");
   if (enabled.has_inlining()) {
     pipeline.Run<WasmInliningPhase>(env, compilation_data, inlining_positions,
@@ -3978,9 +4016,12 @@ turboshaft::PipelineData PipelineImpl::CreateTurboshaftPipeline() {
   return data_->CreateTurboshaftPipeline();
 }
 
+/*
 #if V8_ENABLE_WASM_SIMD256_REVEC
 void PipelineImpl::Revectorize() { Run<RevectorizePhase>(); }
 #endif  // V8_ENABLE_WASM_SIMD256_REVEC
+*/
+void PipelineImpl::KVectorize() { Run<KVectorizePhase>(); }
 
 bool PipelineImpl::SelectInstructions(Linkage* linkage) {
   auto call_descriptor = linkage->GetIncomingDescriptor();
