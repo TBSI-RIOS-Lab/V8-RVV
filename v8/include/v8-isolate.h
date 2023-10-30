@@ -534,8 +534,13 @@ class V8_EXPORT Isolate {
     kTurboFanOsrCompileStarted = 115,
     kAsyncStackTaggingCreateTaskCall = 116,
     kDurationFormat = 117,
-    kInvalidatedNumberStringPrototypeNoReplaceProtector = 118,
-    kRegExpUnicodeSetIncompatibilitiesWithUnicodeMode = 119,
+    kInvalidatedNumberStringNotRegexpLikeProtector = 118,
+    kRegExpUnicodeSetIncompatibilitiesWithUnicodeMode = 119,  // Unused.
+    kImportAssertionDeprecatedSyntax = 120,
+    kLocaleInfoObsoletedGetters = 121,
+    kLocaleInfoFunctions = 122,
+    kCompileHintsMagicAll = 123,
+    kInvalidatedNoProfilingProtector = 124,
 
     // If you add new values here, you'll also need to update Chromium's:
     // web_feature.mojom, use_counter_callback.cc, and enums.xml. V8 changes to
@@ -1123,9 +1128,8 @@ class V8_EXPORT Isolate {
    *
    * This should only be used for testing purposes and not to enforce a garbage
    * collection schedule. It has strong negative impact on the garbage
-   * collection performance. Use IdleNotificationDeadline() or
-   * LowMemoryNotification() instead to influence the garbage collection
-   * schedule.
+   * collection performance. Use MemoryPressureNotification() instead to
+   * influence the garbage collection schedule.
    */
   void RequestGarbageCollectionForTesting(GarbageCollectionType type);
 
@@ -1136,9 +1140,8 @@ class V8_EXPORT Isolate {
    *
    * This should only be used for testing purposes and not to enforce a garbage
    * collection schedule. It has strong negative impact on the garbage
-   * collection performance. Use IdleNotificationDeadline() or
-   * LowMemoryNotification() instead to influence the garbage collection
-   * schedule.
+   * collection performance. Use MemoryPressureNotification() instead to
+   * influence the garbage collection schedule.
    */
   void RequestGarbageCollectionForTesting(GarbageCollectionType type,
                                           StackState stack_state);
@@ -1290,6 +1293,8 @@ class V8_EXPORT Isolate {
    * that function. There is no guarantee that the actual work will be done
    * within the time limit.
    */
+  V8_DEPRECATE_SOON(
+      "Use MemoryPressureNotification() to influence the GC schedule.")
   bool IdleNotificationDeadline(double deadline_in_seconds);
 
   /**
@@ -1320,20 +1325,6 @@ class V8_EXPORT Isolate {
    * V8 uses these notifications to guide heuristics.
    */
   void IsolateInBackgroundNotification();
-
-  /**
-   * Optional notification which will enable the memory savings mode.
-   * V8 uses this notification to guide heuristics which may result in a
-   * smaller memory footprint at the cost of reduced runtime performance.
-   */
-  V8_DEPRECATED("Use IsolateInBackgroundNotification() instead")
-  void EnableMemorySavingsMode();
-
-  /**
-   * Optional notification which will disable the memory savings mode.
-   */
-  V8_DEPRECATED("Use IsolateInBackgroundNotification() instead")
-  void DisableMemorySavingsMode();
 
   /**
    * Optional notification to tell V8 the current performance requirements
@@ -1506,21 +1497,25 @@ class V8_EXPORT Isolate {
 
   void SetWasmLoadSourceMapCallback(WasmLoadSourceMapCallback callback);
 
-  V8_DEPRECATED("Wasm SIMD is always enabled")
-  void SetWasmSimdEnabledCallback(WasmSimdEnabledCallback callback);
-
-  V8_DEPRECATED("Wasm exceptions are always enabled")
-  void SetWasmExceptionsEnabledCallback(WasmExceptionsEnabledCallback callback);
-
   /**
-   * Register callback to control whehter Wasm GC is enabled.
+   * Register callback to control whether Wasm GC is enabled.
    * The callback overwrites the value of the flag.
    * If the callback returns true, it will also enable Wasm stringrefs.
    */
   void SetWasmGCEnabledCallback(WasmGCEnabledCallback callback);
 
+  void SetWasmImportedStringsEnabledCallback(
+      WasmImportedStringsEnabledCallback callback);
+
   void SetSharedArrayBufferConstructorEnabledCallback(
       SharedArrayBufferConstructorEnabledCallback callback);
+
+  /**
+   * Register callback to control whether compile hints magic comments are
+   * enabled.
+   */
+  void SetJavaScriptCompileHintsMagicEnabledCallback(
+      JavaScriptCompileHintsMagicEnabledCallback callback);
 
   /**
    * This function can be called by the embedder to signal V8 that the dynamic
@@ -1583,6 +1578,7 @@ class V8_EXPORT Isolate {
    * heap.  GC is not invoked prior to iterating, therefore there is no
    * guarantee that visited objects are still alive.
    */
+  V8_DEPRECATE_SOON("Will be removed without replacement. crbug.com/v8/14172")
   void VisitExternalResources(ExternalResourceVisitor* visitor);
 
   /**
@@ -1673,10 +1669,12 @@ uint32_t Isolate::GetNumberOfDataSlots() {
 
 template <class T>
 MaybeLocal<T> Isolate::GetDataFromSnapshotOnce(size_t index) {
-  T* data =
-      internal::ValueHelper::SlotAsValue<T>(GetDataFromSnapshotOnce(index));
-  if (data) internal::PerformCastCheck(data);
-  return Local<T>(data);
+  auto slot = GetDataFromSnapshotOnce(index);
+  if (slot) {
+    internal::PerformCastCheck(
+        internal::ValueHelper::SlotAsValue<T, false>(slot));
+  }
+  return Local<T>::FromSlot(slot);
 }
 
 }  // namespace v8

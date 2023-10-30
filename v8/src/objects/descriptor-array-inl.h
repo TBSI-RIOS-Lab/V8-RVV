@@ -16,6 +16,8 @@
 #include "src/objects/maybe-object-inl.h"
 #include "src/objects/property.h"
 #include "src/objects/struct-inl.h"
+#include "src/torque/runtime-macro-shims.h"
+#include "src/torque/runtime-support.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
@@ -306,7 +308,15 @@ DescriptorArrayMarkingState::AcquireDescriptorRangeToMark(
     // 2. Epoch matches but marked/delta is 0: Can happen when descriptors are
     //    newly allocated in the current cycle.
     if (current_epoch != Epoch::decode(raw_gc_state) || (marked + delta) == 0) {
-      const int16_t number_of_descriptors = array.number_of_descriptors();
+      // In case number of descriptors is 0 and we reach the array through roots
+      // marking, mark also slack to get a proper transition from 0 marked to X
+      // marked. Otherwise, we would need to treat the state [0,0[ for marked
+      // and delta as valid state which leads to double-accounting through the
+      // marking barrier (when nof>1 in the barrier).
+      const int16_t number_of_descriptors =
+          array.number_of_descriptors() ? array.number_of_descriptors()
+                                        : array.number_of_all_descriptors();
+      DCHECK_GT(number_of_descriptors, 0);
       if (SwapState(array, raw_gc_state,
                     NewState(current_epoch, number_of_descriptors, 0))) {
         return {0, number_of_descriptors};

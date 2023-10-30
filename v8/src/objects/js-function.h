@@ -5,6 +5,7 @@
 #ifndef V8_OBJECTS_JS_FUNCTION_H_
 #define V8_OBJECTS_JS_FUNCTION_H_
 
+#include "src/base/optional.h"
 #include "src/objects/code-kind.h"
 #include "src/objects/js-objects.h"
 
@@ -120,15 +121,9 @@ class JSFunction : public TorqueGeneratedJSFunction<
   // are fully initialized.
   DECL_ACCESSORS(code, Code)
   DECL_RELEASE_ACQUIRE_ACCESSORS(code, Code)
-  // Convenient overloads to avoid unnecessary InstructionStream <->
-  // Code conversions.
-  // TODO(v8:11880): remove once |code| accessors are migrated to
-  // Code.
-  inline void set_code(InstructionStream code, ReleaseStoreTag,
-                       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
   // Returns the address of the function code's instruction start.
-  inline Address code_entry_point() const;
+  inline Address instruction_start() const;
 
   // Get the abstract code associated with the function, which will either be
   // a InstructionStream object or a BytecodeArray.
@@ -193,7 +188,8 @@ class JSFunction : public TorqueGeneratedJSFunction<
 
   // Sets the interrupt budget based on whether the function has a feedback
   // vector and any optimized code.
-  void SetInterruptBudget(Isolate* isolate);
+  void SetInterruptBudget(Isolate* isolate,
+                          base::Optional<CodeKind> override_active_tier = {});
 
   // If slack tracking is active, it computes instance size of the initial map
   // with minimum permissible object slack.  If it is not active, it simply
@@ -272,7 +268,8 @@ class JSFunction : public TorqueGeneratedJSFunction<
                             Handle<Map> map, Handle<HeapObject> prototype);
   static void SetInitialMap(Isolate* isolate, Handle<JSFunction> function,
                             Handle<Map> map, Handle<HeapObject> prototype,
-                            Handle<HeapObject> constructor);
+                            Handle<JSFunction> constructor);
+
   DECL_GETTER(has_initial_map, bool)
   V8_EXPORT_PRIVATE static void EnsureHasInitialMap(
       Handle<JSFunction> function);

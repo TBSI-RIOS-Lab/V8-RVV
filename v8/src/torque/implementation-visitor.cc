@@ -170,6 +170,7 @@ void ImplementationVisitor::BeginDebugMacrosFile() {
   source << "#include \"torque-generated/debug-macros.h\"\n\n";
   source << "#include \"src/objects/swiss-name-dictionary.h\"\n";
   source << "#include \"src/objects/ordered-hash-table.h\"\n";
+  source << "#include \"src/torque/runtime-support.h\"\n";
   source << "#include \"tools/debug_helper/debug-macro-shims.h\"\n";
   source << "#include \"include/v8-internal.h\"\n";
   source << "\n";
@@ -1487,7 +1488,9 @@ void ImplementationVisitor::InitializeClass(
     InitializeClass(super, allocate_result, initializer_results, layout);
   }
 
-  for (Field f : class_type->fields()) {
+  for (const Field& f : class_type->fields()) {
+    // Support optional padding fields.
+    if (f.name_and_type.type->IsVoid()) continue;
     VisitResult initializer_value =
         initializer_results.field_value_map.at(f.name_and_type.name);
     LocationReference field =
@@ -2830,6 +2833,9 @@ VisitResult ImplementationVisitor::GenerateCall(
     GenerateCatchBlock(catch_block);
     if (is_tailcall) {
       return VisitResult::NeverResult();
+    } else if (return_type->IsNever()) {
+      assembler().Emit(AbortInstruction{AbortInstruction::Kind::kUnreachable});
+      return VisitResult::NeverResult();
     } else {
       size_t slot_count = LoweredSlotCount(return_type);
       if (builtin->IsStub()) {
@@ -3605,10 +3611,13 @@ void ImplementationVisitor::GenerateBuiltinDefinitionsAndInterfaceDescriptors(
           interface_descriptors << "  DEFINE_RESULT_AND_PARAMETER_TYPES(";
           PrintCommaSeparatedList(interface_descriptors, return_types,
                                   MachineTypeString);
+          bool is_first = return_types.empty();
           for (size_t i = kFirstNonContextParameter;
                i < builtin->parameter_names().size(); ++i) {
             const Type* type = builtin->signature().parameter_types.types[i];
-            interface_descriptors << ", " << MachineTypeString(type);
+            interface_descriptors << (is_first ? "" : ", ")
+                                  << MachineTypeString(type);
+            is_first = false;
           }
           interface_descriptors << ")\n";
 
@@ -3864,7 +3873,8 @@ void ImplementationVisitor::GenerateVisitorLists(
 
     header << "#define TORQUE_DATA_ONLY_VISITOR_ID_LIST(V)\\\n";
     for (const ClassType* type : TypeOracle::GetClasses()) {
-      if (type->ShouldGenerateBodyDescriptor() && type->HasNoPointerSlots()) {
+      if (type->ShouldGenerateBodyDescriptor() &&
+          type->HasNoPointerSlotsExceptMap()) {
         header << "V(" << type->name() << ")\\\n";
       }
     }
@@ -3872,7 +3882,8 @@ void ImplementationVisitor::GenerateVisitorLists(
 
     header << "#define TORQUE_POINTER_VISITOR_ID_LIST(V)\\\n";
     for (const ClassType* type : TypeOracle::GetClasses()) {
-      if (type->ShouldGenerateBodyDescriptor() && !type->HasNoPointerSlots()) {
+      if (type->ShouldGenerateBodyDescriptor() &&
+          !type->HasNoPointerSlotsExceptMap()) {
         header << "V(" << type->name() << ")\\\n";
       }
     }
@@ -4320,28 +4331,16 @@ void CppClassGenerator::GenerateClassConstructors() {
   hdr_ << "  }\n\n";
 
   hdr_ << " protected:\n";
+  hdr_ << "  inline explicit constexpr " << gen_name_
+       << "(Address ptr, Object::SkipTypeCheckTag\n)";
+  hdr_ << "    : P(ptr, Object::SkipTypeCheckTag()) {}\n";
   hdr_ << "  inline explicit " << gen_name_ << "(Address ptr);\n";
-  hdr_ << "  // Special-purpose constructor for subclasses that have fast "
-          "paths where\n";
-  hdr_ << "  // their ptr() is a Smi.\n";
-  hdr_ << "  inline explicit " << gen_name_
-       << "(Address ptr, HeapObject::AllowInlineSmiStorage allow_smi);\n";
 
   inl_ << "template<class D, class P>\n";
   inl_ << "inline " << gen_name_T_ << "::" << gen_name_ << "(Address ptr)\n";
   inl_ << "    : P(ptr) {\n";
   inl_ << "  SLOW_DCHECK(Is" << typecheck_type->name()
        << "_NonInline(*this));\n";
-  inl_ << "}\n";
-
-  inl_ << "template<class D, class P>\n";
-  inl_ << "inline " << gen_name_T_ << "::" << gen_name_
-       << "(Address ptr, HeapObject::AllowInlineSmiStorage allow_smi)\n";
-  inl_ << "    : P(ptr, allow_smi) {\n";
-  inl_ << "  SLOW_DCHECK("
-       << "(allow_smi == HeapObject::AllowInlineSmiStorage::kAllowBeingASmi"
-          " && this->IsSmi()) || Is"
-       << typecheck_type->name() << "_NonInline(*this));\n";
   inl_ << "}\n";
 }
 
@@ -4808,14 +4807,14 @@ void ImplementationVisitor::GenerateClassDefinitions(
         }
 
         factory_impl << ");\n";
-        factory_impl << "  Map map = factory()->read_only_roots()."
+        factory_impl << "  Tagged<Map> map = factory()->read_only_roots()."
                      << SnakeifyString(type->name()) << "_map();";
-        factory_impl << "  HeapObject raw_object =\n";
+        factory_impl << "  Tagged<HeapObject> raw_object =\n";
         factory_impl << "    factory()->AllocateRawWithImmortalMap(size, "
                         "allocation_type, map);\n";
-        factory_impl << "  " << type->UnhandlifiedCppTypeName()
-                     << " result = " << type->UnhandlifiedCppTypeName()
-                     << "::cast(raw_object);\n";
+        factory_impl << "  Tagged<" << type->UnhandlifiedCppTypeName()
+                     << "> result = Tagged<" << type->UnhandlifiedCppTypeName()
+                     << ">::cast(raw_object);\n";
         factory_impl << "  DisallowGarbageCollection no_gc;";
         factory_impl << "  WriteBarrierMode write_barrier_mode =\n"
                      << "     allocation_type == AllocationType::kYoung\n"
@@ -4825,7 +4824,7 @@ void ImplementationVisitor::GenerateClassDefinitions(
         for (const Field& f : type->ComputeAllFields()) {
           if (f.name_and_type.name == "map") continue;
           if (!f.index) {
-            factory_impl << "  result.TorqueGeneratedClass::set_"
+            factory_impl << "  result->TorqueGeneratedClass::set_"
                          << SnakeifyString(f.name_and_type.name) << "(";
             if (f.name_and_type.type->IsSubtypeOf(
                     TypeOracle::GetTaggedType()) &&

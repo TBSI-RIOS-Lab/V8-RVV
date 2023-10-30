@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <cinttypes>
+
 #include "include/v8-wasm.h"
 #include "src/base/memory.h"
 #include "src/base/platform/mutex.h"
@@ -78,15 +80,17 @@ void ThrowRangeException(v8::Isolate* isolate, const char* message) {
   isolate->ThrowException(NewRangeException(isolate, message));
 }
 
-bool WasmModuleOverride(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  if (IsWasmCompileAllowed(args.GetIsolate(), args[0], false)) return false;
-  ThrowRangeException(args.GetIsolate(), "Sync compile not allowed");
+bool WasmModuleOverride(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DCHECK(ValidateCallbackInfo(info));
+  if (IsWasmCompileAllowed(info.GetIsolate(), info[0], false)) return false;
+  ThrowRangeException(info.GetIsolate(), "Sync compile not allowed");
   return true;
 }
 
-bool WasmInstanceOverride(const v8::FunctionCallbackInfo<v8::Value>& args) {
-  if (IsWasmInstantiateAllowed(args.GetIsolate(), args[0], false)) return false;
-  ThrowRangeException(args.GetIsolate(), "Sync instantiate not allowed");
+bool WasmInstanceOverride(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  DCHECK(ValidateCallbackInfo(info));
+  if (IsWasmInstantiateAllowed(info.GetIsolate(), info[0], false)) return false;
+  ThrowRangeException(info.GetIsolate(), "Sync instantiate not allowed");
   return true;
 }
 
@@ -99,7 +103,7 @@ RUNTIME_FUNCTION(Runtime_SetWasmCompileControls) {
   v8::Isolate* v8_isolate = reinterpret_cast<v8::Isolate*>(isolate);
   CHECK_EQ(args.length(), 2);
   int block_size = args.smi_value_at(0);
-  bool allow_async = Oddball::cast(args[1]).ToBool(isolate);
+  bool allow_async = Boolean::cast(args[1]).ToBool(isolate);
   base::MutexGuard guard(g_PerIsolateWasmControlsMutex.Pointer());
   WasmCompileControls& ctrl = (*GetPerIsolateWasmControls())[v8_isolate];
   ctrl.AllowAnySizeForAsync = allow_async;
@@ -258,7 +262,7 @@ bool DisallowWasmCodegenFromStringsCallback(v8::Local<v8::Context> context,
 RUNTIME_FUNCTION(Runtime_DisallowWasmCodegen) {
   SealHandleScope shs(isolate);
   DCHECK_EQ(1, args.length());
-  bool flag = Oddball::cast(args[0]).ToBool(isolate);
+  bool flag = Boolean::cast(args[0]).ToBool(isolate);
   v8::Isolate* v8_isolate = reinterpret_cast<v8::Isolate*>(isolate);
   v8_isolate->SetAllowWasmCodeGenerationCallback(
       flag ? DisallowWasmCodegenFromStringsCallback : nullptr);
@@ -270,8 +274,10 @@ RUNTIME_FUNCTION(Runtime_IsWasmCode) {
   DCHECK_EQ(1, args.length());
   auto function = JSFunction::cast(args[0]);
   Code code = function.code();
-  bool is_js_to_wasm = code.kind() == CodeKind::JS_TO_WASM_FUNCTION ||
-                       (code.builtin_id() == Builtin::kGenericJSToWasmWrapper);
+  bool is_js_to_wasm =
+      code.kind() == CodeKind::JS_TO_WASM_FUNCTION ||
+      (code.builtin_id() == Builtin::kGenericJSToWasmWrapper) ||
+      (code.builtin_id() == Builtin::kJSToWasmWrapper);
   return isolate->heap()->ToBoolean(is_js_to_wasm);
 }
 
@@ -279,6 +285,12 @@ RUNTIME_FUNCTION(Runtime_IsWasmTrapHandlerEnabled) {
   DisallowGarbageCollection no_gc;
   DCHECK_EQ(0, args.length());
   return isolate->heap()->ToBoolean(trap_handler::IsTrapHandlerEnabled());
+}
+
+RUNTIME_FUNCTION(Runtime_IsWasmPartialOOBWriteNoop) {
+  DisallowGarbageCollection no_gc;
+  DCHECK_EQ(0, args.length());
+  return isolate->heap()->ToBoolean(wasm::kPartialOOBWritesAreNoops);
 }
 
 RUNTIME_FUNCTION(Runtime_IsThreadInWasm) {
@@ -317,7 +329,18 @@ RUNTIME_FUNCTION(Runtime_GetWasmExceptionValues) {
       WasmExceptionPackage::GetExceptionValues(isolate, exception);
   CHECK(values_obj->IsFixedArray());  // Only called with correct input.
   Handle<FixedArray> values = Handle<FixedArray>::cast(values_obj);
-  return *isolate->factory()->NewJSArrayWithElements(values);
+  Handle<FixedArray> externalized_values =
+      isolate->factory()->NewFixedArray(values->length());
+  for (int i = 0; i < values->length(); i++) {
+    Handle<Object> value = handle(values->get(i), isolate);
+    if (!value->IsSmi()) {
+      // Note: This will leak string views to JS. This should be fine for a
+      // debugging function.
+      value = wasm::WasmToJSObject(isolate, value);
+    }
+    externalized_values->set(i, *value);
+  }
+  return *isolate->factory()->NewJSArrayWithElements(externalized_values);
 }
 
 RUNTIME_FUNCTION(Runtime_SerializeWasmModule) {
@@ -402,7 +425,8 @@ RUNTIME_FUNCTION(Runtime_WasmNumCodeSpaces) {
 }
 
 RUNTIME_FUNCTION(Runtime_WasmTraceMemory) {
-  HandleScope scope(isolate);
+  SealHandleScope scope(isolate);
+  DisallowGarbageCollection no_gc;
   DCHECK_EQ(1, args.length());
   auto info_addr = Smi::cast(args[0]);
 
@@ -416,8 +440,10 @@ RUNTIME_FUNCTION(Runtime_WasmTraceMemory) {
   DCHECK(it.is_wasm());
   WasmFrame* frame = WasmFrame::cast(it.frame());
 
-  uint8_t* mem_start = reinterpret_cast<uint8_t*>(
-      frame->wasm_instance().memory_object().array_buffer().backing_store());
+  // TODO(13918): Fix for multi-memory.
+  auto memory_object = frame->wasm_instance().memory_object(0);
+  uint8_t* mem_start =
+      reinterpret_cast<uint8_t*>(memory_object.array_buffer().backing_store());
   int func_index = frame->function_index();
   int pos = frame->position();
   wasm::ExecutionTier tier = frame->wasm_code()->is_liftoff()

@@ -75,12 +75,13 @@ void SimpleCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
   info.GetReturnValue().Set(v8::Number::New(isolate, 0));
 }
 
-struct FlagAndGlobal {
+struct FlagAndHandles {
   bool flag;
   v8::Global<v8::Object> handle;
+  v8::Local<v8::Object> local;
 };
 
-void ResetHandleAndSetFlag(const v8::WeakCallbackInfo<FlagAndGlobal>& data) {
+void ResetHandleAndSetFlag(const v8::WeakCallbackInfo<FlagAndHandles>& data) {
   data.GetParameter()->handle.Reset();
   data.GetParameter()->flag = true;
 }
@@ -135,12 +136,10 @@ void WeakHandleTest(v8::Isolate* isolate, ConstructFunction construct_function,
                     ModifierFunction modifier_function, GCFunction gc_function,
                     SurvivalMode survives) {
   v8::HandleScope scope(isolate);
-  DisableConservativeStackScanningScopeForTesting no_stack_scanning(
-      reinterpret_cast<i::Isolate*>(isolate)->heap());
   v8::Local<v8::Context> context = v8::Context::New(isolate);
   v8::Context::Scope context_scope(context);
 
-  FlagAndGlobal fp;
+  FlagAndHandles fp;
   construct_function(isolate, context, &fp);
   CHECK(IsNewObjectInCorrectGeneration(isolate, fp.handle));
   fp.handle.SetWeak(&fp, &ResetHandleAndSetFlag,
@@ -175,7 +174,7 @@ class GlobalHandlesTest : public TestWithContext {
     construct_function(isolate, context, fp.get());
     CHECK(IsNewObjectInCorrectGeneration(isolate, fp->handle));
     modifier_function(fp.get());
-    CollectGarbage(i::NEW_SPACE);
+    InvokeMinorGC();
     // Scavenge clear properly resets the original handle, so we can check the
     // handle directly here.
     CHECK_IMPLIES(survives == SurvivalMode::kSurvives, !fp->handle.IsEmpty());
@@ -217,7 +216,7 @@ TEST_F(GlobalHandlesTest, EternalHandles) {
     CHECK(!eternals[i].IsEmpty());
   }
 
-  CollectAllAvailableGarbage();
+  InvokeMemoryReducingMajorGCs(isolate);
 
   for (int i = 0; i < kArrayLength; i++) {
     for (int j = 0; j < 2; j++) {
@@ -295,7 +294,7 @@ TEST_F(GlobalHandlesTest, PhantomHandlesWithoutCallbacks) {
   }
   CHECK(!g1.IsEmpty());
   CHECK(!g2.IsEmpty());
-  CollectAllAvailableGarbage();
+  InvokeMemoryReducingMajorGCs(i_isolate());
   CHECK(g1.IsEmpty());
   CHECK(g2.IsEmpty());
 }
@@ -303,9 +302,14 @@ TEST_F(GlobalHandlesTest, PhantomHandlesWithoutCallbacks) {
 TEST_F(GlobalHandlesTest, WeakHandleToUnmodifiedJSObjectDiesOnScavenge) {
   if (v8_flags.single_generation) return;
 
+  // We need to invoke GC without stack, otherwise the object may survive.
+  DisableConservativeStackScanningScopeForTesting no_stack_scanning(
+      i_isolate()->heap());
+
   WeakHandleTest(
-      v8_isolate(), &ConstructJSObject<FlagAndGlobal>, [](FlagAndGlobal* fp) {},
-      [this]() { CollectGarbage(i::NEW_SPACE); }, SurvivalMode::kDies);
+      v8_isolate(), &ConstructJSObject<FlagAndHandles>,
+      [](FlagAndHandles* fp) {}, [this]() { InvokeMinorGC(); },
+      SurvivalMode::kDies);
 }
 
 TEST_F(GlobalHandlesTest, TracedReferenceToUnmodifiedJSObjectSurvivesScavenge) {
@@ -318,29 +322,36 @@ TEST_F(GlobalHandlesTest, TracedReferenceToUnmodifiedJSObjectSurvivesScavenge) {
 }
 
 TEST_F(GlobalHandlesTest, WeakHandleToUnmodifiedJSObjectDiesOnMarkCompact) {
+  // We need to invoke GC without stack, otherwise the object may survive.
+  DisableConservativeStackScanningScopeForTesting no_stack_scanning(
+      i_isolate()->heap());
+
   WeakHandleTest(
-      v8_isolate(), &ConstructJSObject<FlagAndGlobal>, [](FlagAndGlobal* fp) {},
-      [this]() { CollectAllGarbage(); }, SurvivalMode::kDies);
+      v8_isolate(), &ConstructJSObject<FlagAndHandles>,
+      [](FlagAndHandles* fp) {}, [this]() { InvokeMajorGC(); },
+      SurvivalMode::kDies);
 }
 
 TEST_F(GlobalHandlesTest,
        WeakHandleToUnmodifiedJSObjectSurvivesMarkCompactWhenInHandle) {
   WeakHandleTest(
-      v8_isolate(), &ConstructJSObject<FlagAndGlobal>,
-      [this](FlagAndGlobal* fp) {
-        v8::Local<v8::Object> handle =
-            v8::Local<v8::Object>::New(v8_isolate(), fp->handle);
-        USE(handle);
+      v8_isolate(), &ConstructJSObject<FlagAndHandles>,
+      [this](FlagAndHandles* fp) {
+        fp->local = v8::Local<v8::Object>::New(v8_isolate(), fp->handle);
       },
-      [this]() { CollectAllGarbage(); }, SurvivalMode::kSurvives);
+      [this]() { InvokeMajorGC(); }, SurvivalMode::kSurvives);
 }
 
 TEST_F(GlobalHandlesTest, WeakHandleToUnmodifiedJSApiObjectDiesOnScavenge) {
   if (v8_flags.single_generation) return;
 
+  // We need to invoke GC without stack, otherwise the object may survive.
+  DisableConservativeStackScanningScopeForTesting no_stack_scanning(
+      i_isolate()->heap());
+
   WeakHandleTest(
-      v8_isolate(), &ConstructJSApiObject<FlagAndGlobal>,
-      [](FlagAndGlobal* fp) {}, [this]() { CollectGarbage(i::NEW_SPACE); },
+      v8_isolate(), &ConstructJSApiObject<FlagAndHandles>,
+      [](FlagAndHandles* fp) {}, [this]() { InvokeMinorGC(); },
       SurvivalMode::kDies);
 }
 
@@ -381,32 +392,32 @@ TEST_F(GlobalHandlesTest,
   if (v8_flags.single_generation) return;
 
   WeakHandleTest(
-      v8_isolate(), &ConstructJSApiObject<FlagAndGlobal>,
-      [this](FlagAndGlobal* fp) {
-        v8::Local<v8::Object> handle =
-            v8::Local<v8::Object>::New(v8_isolate(), fp->handle);
-        USE(handle);
+      v8_isolate(), &ConstructJSApiObject<FlagAndHandles>,
+      [this](FlagAndHandles* fp) {
+        fp->local = v8::Local<v8::Object>::New(v8_isolate(), fp->handle);
       },
-      [this]() { CollectGarbage(i::NEW_SPACE); }, SurvivalMode::kSurvives);
+      [this]() { InvokeMinorGC(); }, SurvivalMode::kSurvives);
 }
 
 TEST_F(GlobalHandlesTest, WeakHandleToUnmodifiedJSApiObjectDiesOnMarkCompact) {
+  // We need to invoke GC without stack, otherwise the object may survive.
+  DisableConservativeStackScanningScopeForTesting no_stack_scanning(
+      i_isolate()->heap());
+
   WeakHandleTest(
-      v8_isolate(), &ConstructJSApiObject<FlagAndGlobal>,
-      [](FlagAndGlobal* fp) {}, [this]() { CollectAllGarbage(); },
+      v8_isolate(), &ConstructJSApiObject<FlagAndHandles>,
+      [](FlagAndHandles* fp) {}, [this]() { InvokeMajorGC(); },
       SurvivalMode::kDies);
 }
 
 TEST_F(GlobalHandlesTest,
        WeakHandleToUnmodifiedJSApiObjectSurvivesMarkCompactWhenInHandle) {
   WeakHandleTest(
-      v8_isolate(), &ConstructJSApiObject<FlagAndGlobal>,
-      [this](FlagAndGlobal* fp) {
-        v8::Local<v8::Object> handle =
-            v8::Local<v8::Object>::New(v8_isolate(), fp->handle);
-        USE(handle);
+      v8_isolate(), &ConstructJSApiObject<FlagAndHandles>,
+      [this](FlagAndHandles* fp) {
+        fp->local = v8::Local<v8::Object>::New(v8_isolate(), fp->handle);
       },
-      [this]() { CollectAllGarbage(); }, SurvivalMode::kSurvives);
+      [this]() { InvokeMajorGC(); }, SurvivalMode::kSurvives);
 }
 
 TEST_F(GlobalHandlesTest,
@@ -427,7 +438,7 @@ TEST_F(GlobalHandlesTest,
     auto i = function->NewInstance(v8_context()).ToLocalChecked();
     handle.Reset(isolate, i);
   }
-  CollectGarbage(i::NEW_SPACE);
+  InvokeMinorGC();
   CHECK(!handle.IsEmpty());
 }
 
@@ -451,30 +462,30 @@ TEST_F(GlobalHandlesTest,
     auto i = function->NewInstance(v8_context()).ToLocalChecked();
     handle.Reset(isolate, i);
   }
-  CollectGarbage(i::NEW_SPACE);
+  InvokeMinorGC();
   CHECK(!handle.IsEmpty());
 }
 
 namespace {
 
-void ForceScavenge2(const v8::WeakCallbackInfo<FlagAndGlobal>& data) {
+void ForceMinorGC2(const v8::WeakCallbackInfo<FlagAndHandles>& data) {
   data.GetParameter()->flag = true;
-  YoungGC(data.GetIsolate());
+  InvokeMinorGC(reinterpret_cast<Isolate*>(data.GetIsolate()));
 }
 
-void ForceScavenge1(const v8::WeakCallbackInfo<FlagAndGlobal>& data) {
+void ForceMinorGC1(const v8::WeakCallbackInfo<FlagAndHandles>& data) {
   data.GetParameter()->handle.Reset();
-  data.SetSecondPassCallback(ForceScavenge2);
+  data.SetSecondPassCallback(ForceMinorGC2);
 }
 
-void ForceMarkSweep2(const v8::WeakCallbackInfo<FlagAndGlobal>& data) {
+void ForceMajorGC2(const v8::WeakCallbackInfo<FlagAndHandles>& data) {
   data.GetParameter()->flag = true;
-  FullGC(data.GetIsolate());
+  InvokeMajorGC(reinterpret_cast<Isolate*>(data.GetIsolate()));
 }
 
-void ForceMarkSweep1(const v8::WeakCallbackInfo<FlagAndGlobal>& data) {
+void ForceMajorGC1(const v8::WeakCallbackInfo<FlagAndHandles>& data) {
   data.GetParameter()->handle.Reset();
-  data.SetSecondPassCallback(ForceMarkSweep2);
+  data.SetSecondPassCallback(ForceMajorGC2);
 }
 
 }  // namespace
@@ -488,31 +499,30 @@ TEST_F(GlobalHandlesTest, GCFromWeakCallbacks) {
   v8::Context::Scope context_scope(context);
 
   if (v8_flags.single_generation) {
-    FlagAndGlobal fp;
+    FlagAndHandles fp;
     ConstructJSApiObject(isolate, context, &fp);
     CHECK_IMPLIES(!v8_flags.single_generation,
                   !InYoungGeneration(isolate, fp.handle));
     fp.flag = false;
-    fp.handle.SetWeak(&fp, &ForceMarkSweep1, v8::WeakCallbackType::kParameter);
-    CollectAllGarbage();
+    fp.handle.SetWeak(&fp, &ForceMajorGC1, v8::WeakCallbackType::kParameter);
+    InvokeMajorGC();
     EmptyMessageQueues();
     CHECK(fp.flag);
     return;
   }
 
   static const int kNumberOfGCTypes = 2;
-  using Callback = v8::WeakCallbackInfo<FlagAndGlobal>::Callback;
-  Callback gc_forcing_callback[kNumberOfGCTypes] = {&ForceScavenge1,
-                                                    &ForceMarkSweep1};
+  using Callback = v8::WeakCallbackInfo<FlagAndHandles>::Callback;
+  Callback gc_forcing_callback[kNumberOfGCTypes] = {&ForceMinorGC1,
+                                                    &ForceMajorGC1};
 
   using GCInvoker = std::function<void(void)>;
-  GCInvoker invoke_gc[kNumberOfGCTypes] = {
-      [this]() { CollectGarbage(i::NEW_SPACE); },
-      [this]() { CollectAllGarbage(); }};
+  GCInvoker invoke_gc[kNumberOfGCTypes] = {[this]() { InvokeMinorGC(); },
+                                           [this]() { InvokeMajorGC(); }};
 
   for (int outer_gc = 0; outer_gc < kNumberOfGCTypes; outer_gc++) {
     for (int inner_gc = 0; inner_gc < kNumberOfGCTypes; inner_gc++) {
-      FlagAndGlobal fp;
+      FlagAndHandles fp;
       ConstructJSApiObject(isolate, context, &fp);
       CHECK(InYoungGeneration(isolate, fp.handle));
       fp.flag = false;
@@ -527,11 +537,11 @@ TEST_F(GlobalHandlesTest, GCFromWeakCallbacks) {
 
 namespace {
 
-void SecondPassCallback(const v8::WeakCallbackInfo<FlagAndGlobal>& data) {
+void SecondPassCallback(const v8::WeakCallbackInfo<FlagAndHandles>& data) {
   data.GetParameter()->flag = true;
 }
 
-void FirstPassCallback(const v8::WeakCallbackInfo<FlagAndGlobal>& data) {
+void FirstPassCallback(const v8::WeakCallbackInfo<FlagAndHandles>& data) {
   data.GetParameter()->handle.Reset();
   data.SetSecondPassCallback(SecondPassCallback);
 }
@@ -545,13 +555,13 @@ TEST_F(GlobalHandlesTest, SecondPassPhantomCallbacks) {
   v8::HandleScope scope(isolate);
   v8::Local<v8::Context> context = v8::Context::New(isolate);
   v8::Context::Scope context_scope(context);
-  FlagAndGlobal fp;
+  FlagAndHandles fp;
   ConstructJSApiObject(isolate, context, &fp);
   fp.flag = false;
   fp.handle.SetWeak(&fp, FirstPassCallback, v8::WeakCallbackType::kParameter);
   CHECK(!fp.flag);
-  CollectAllGarbage();
-  CollectAllGarbage();
+  InvokeMajorGC();
+  InvokeMajorGC();
   CHECK(fp.flag);
 }
 
@@ -561,10 +571,10 @@ TEST_F(GlobalHandlesTest, MoveStrongGlobal) {
 
   v8::Global<v8::Object>* global = new Global<v8::Object>();
   ConstructJSObject(isolate, global);
-  CollectAllGarbage();
+  InvokeMajorGC();
   v8::Global<v8::Object> global2(std::move(*global));
   delete global;
-  CollectAllGarbage();
+  InvokeMajorGC();
 }
 
 TEST_F(GlobalHandlesTest, MoveWeakGlobal) {
@@ -573,11 +583,11 @@ TEST_F(GlobalHandlesTest, MoveWeakGlobal) {
 
   v8::Global<v8::Object>* global = new Global<v8::Object>();
   ConstructJSObject(isolate, global);
-  CollectAllGarbage();
+  InvokeMajorGC();
   global->SetWeak();
   v8::Global<v8::Object> global2(std::move(*global));
   delete global;
-  CollectAllGarbage();
+  InvokeMajorGC();
 }
 
 TEST_F(GlobalHandlesTest, TotalSizeRegularNode) {
@@ -607,7 +617,7 @@ TEST_F(GlobalHandlesTest, TotalSizeTracedNode) {
   CHECK_GT(i_isolate()->traced_handles()->total_size_bytes(), 0);
   CHECK_GT(i_isolate()->traced_handles()->used_size_bytes(), 0);
   delete handle;
-  CollectAllGarbage();
+  InvokeMajorGC();
   CHECK_GT(i_isolate()->traced_handles()->total_size_bytes(), 0);
   CHECK_EQ(i_isolate()->traced_handles()->used_size_bytes(), 0);
 }

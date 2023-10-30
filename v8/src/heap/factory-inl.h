@@ -9,9 +9,11 @@
 
 // Clients of this interface shouldn't depend on lots of heap internals.
 // Do not include anything from src/heap here!
+// TODO(all): Remove the heap-inl.h include below.
 #include "src/execution/isolate-inl.h"
 #include "src/handles/handles-inl.h"
 #include "src/heap/factory-base-inl.h"
+#include "src/heap/heap-inl.h"  // For MaxNumberToStringCacheSize.
 #include "src/objects/feedback-cell.h"
 #include "src/objects/heap-number-inl.h"
 #include "src/objects/objects-inl.h"
@@ -30,11 +32,6 @@ namespace internal {
 MUTABLE_ROOT_LIST(ROOT_ACCESSOR)
 #undef ROOT_ACCESSOR
 
-bool Factory::CodeBuilder::CompiledWithConcurrentBaseline() const {
-  return v8_flags.concurrent_sparkplug && kind_ == CodeKind::BASELINE &&
-         !local_isolate_->is_main_thread();
-}
-
 Handle<String> Factory::InternalizeString(Handle<String> string) {
   if (string->IsInternalizedString()) return string;
   return isolate()->string_table()->LookupString(isolate(), string);
@@ -44,6 +41,20 @@ Handle<Name> Factory::InternalizeName(Handle<Name> name) {
   if (name->IsUniqueName()) return name;
   return isolate()->string_table()->LookupString(isolate(),
                                                  Handle<String>::cast(name));
+}
+
+template <size_t N>
+Handle<String> Factory::NewStringFromStaticChars(const char (&str)[N],
+                                                 AllocationType allocation) {
+  DCHECK_EQ(N, strlen(str) + 1);
+  return NewStringFromOneByte(base::StaticOneByteVector(str), allocation)
+      .ToHandleChecked();
+}
+
+Handle<String> Factory::NewStringFromAsciiChecked(const char* str,
+                                                  AllocationType allocation) {
+  return NewStringFromOneByte(base::OneByteVector(str), allocation)
+      .ToHandleChecked();
 }
 
 Handle<String> Factory::NewSubString(Handle<String> str, int begin, int end) {
@@ -65,6 +76,13 @@ Handle<JSObject> Factory::NewFastOrSlowJSObjectFromMap(
              ? NewSlowJSObjectFromMap(map, number_of_slow_properties,
                                       allocation, allocation_site)
              : NewJSObjectFromMap(map, allocation, allocation_site);
+}
+
+Handle<JSObject> Factory::NewFastOrSlowJSObjectFromMap(Handle<Map> map) {
+  return NewFastOrSlowJSObjectFromMap(
+      map, V8_ENABLE_SWISS_NAME_DICTIONARY_BOOL
+               ? SwissNameDictionary::kInitialCapacity
+               : NameDictionary::kInitialCapacity);
 }
 
 Handle<Object> Factory::NewURIError() {
@@ -107,13 +125,14 @@ void Factory::NumberToStringCacheSet(Handle<Object> number, int hash,
   cache.set(hash * 2 + 1, *js_string);
 }
 
-Handle<Object> Factory::NumberToStringCacheGet(Object number, int hash) {
+Handle<Object> Factory::NumberToStringCacheGet(Tagged<Object> number,
+                                               int hash) {
   DisallowGarbageCollection no_gc;
-  FixedArray cache = *number_string_cache();
-  Object key = cache.get(hash * 2);
+  Tagged<FixedArray> cache = *number_string_cache();
+  Tagged<Object> key = cache->get(hash * 2);
   if (key == number || (key.IsHeapNumber() && number.IsHeapNumber() &&
-                        key.Number() == number.Number())) {
-    return Handle<String>(String::cast(cache.get(hash * 2 + 1)), isolate());
+                        key->Number() == number->Number())) {
+    return Handle<String>(String::cast(cache->get(hash * 2 + 1)), isolate());
   }
   return undefined_value();
 }

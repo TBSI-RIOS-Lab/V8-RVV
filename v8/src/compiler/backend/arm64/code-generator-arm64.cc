@@ -426,18 +426,7 @@ class WasmOutOfLineTrap : public OutOfLineCode {
       __ Ret();
     } else {
       gen_->AssembleSourcePosition(instr_);
-      // A direct call to a wasm runtime stub defined in this module.
-      // Just encode the stub index. This will be patched when the code
-      // is added to the native module and copied into wasm code space.
-      if (gen_->IsWasm() || PointerCompressionIsEnabled()) {
-        __ Call(static_cast<Address>(trap_id), RelocInfo::WASM_STUB_CALL);
-      } else {
-        // For wasm traps inlined into JavaScript force indirect call if pointer
-        // compression is disabled as it can't be guaranteed that the built-in's
-        // address is close enough for a near call.
-        __ IndirectCall(static_cast<Address>(trap_id),
-                        RelocInfo::WASM_STUB_CALL);
-      }
+      __ Call(static_cast<Address>(trap_id), RelocInfo::WASM_STUB_CALL);
       ReferenceMap* reference_map =
           gen_->zone()->New<ReferenceMap>(gen_->zone());
       gen_->RecordSafepoint(reference_map);
@@ -775,7 +764,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kArchCallBuiltinPointer: {
       DCHECK(!instr->InputAt(0)->IsImmediate());
       Register builtin_index = i.InputRegister(0);
-      __ CallBuiltinByIndex(builtin_index);
+      Register target =
+          instr->HasCallDescriptorFlag(CallDescriptor::kFixedTargetRegister)
+              ? kJavaScriptCallCodeStartRegister
+              : builtin_index;
+      __ CallBuiltinByIndex(builtin_index, target);
       RecordCallPosition(instr);
       frame_access_state()->ClearSPDelta();
       break;
@@ -1977,6 +1970,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       EmitOOLTrapIfNeeded(zone(), this, opcode, instr, __ pc_offset());
       __ Str(i.InputOrZeroRegister32(0), i.MemoryOperand(1));
       break;
+    case kArm64StrWPair:
+      EmitOOLTrapIfNeeded(zone(), this, opcode, instr, __ pc_offset());
+      __ Stp(i.InputOrZeroRegister32(0), i.InputOrZeroRegister32(1),
+             i.MemoryOperand(2));
+      break;
     case kArm64Ldr:
       EmitOOLTrapIfNeeded(zone(), this, opcode, instr, __ pc_offset());
       __ Ldr(i.OutputRegister(), i.MemoryOperand());
@@ -2003,6 +2001,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kArm64Str:
       EmitOOLTrapIfNeeded(zone(), this, opcode, instr, __ pc_offset());
       __ Str(i.InputOrZeroRegister64(0), i.MemoryOperand(1));
+      break;
+    case kArm64StrPair:
+      EmitOOLTrapIfNeeded(zone(), this, opcode, instr, __ pc_offset());
+      __ Stp(i.InputOrZeroRegister64(0), i.InputOrZeroRegister64(1),
+             i.MemoryOperand(2));
       break;
     case kArm64StrCompressTagged:
       EmitOOLTrapIfNeeded(zone(), this, opcode, instr, __ pc_offset());
@@ -2594,19 +2597,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       SIMD_BINOP_LANE_SIZE_CASE(kArm64IGtU, Cmhi);
       SIMD_BINOP_LANE_SIZE_CASE(kArm64IGeU, Cmhs);
     case kArm64I32x4BitMask: {
-      UseScratchRegisterScope scope(masm());
-      Register dst = i.OutputRegister32();
-      VRegister src = i.InputSimd128Register(0);
-      VRegister tmp = scope.AcquireQ();
-      VRegister mask = scope.AcquireQ();
-
-      __ Sshr(tmp.V4S(), src.V4S(), 31);
-      // Set i-th bit of each lane i. When AND with tmp, the lanes that
-      // are signed will have i-th bit set, unsigned will be 0.
-      __ Movi(mask.V2D(), 0x0000'0008'0000'0004, 0x0000'0002'0000'0001);
-      __ And(tmp.V16B(), mask.V16B(), tmp.V16B());
-      __ Addv(tmp.S(), tmp.V4S());
-      __ Mov(dst.W(), tmp.V4S(), 0);
+      __ I32x4BitMask(i.OutputRegister32(), i.InputSimd128Register(0));
       break;
     }
     case kArm64I32x4DotI16x8S: {
@@ -2712,19 +2703,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       SIMD_BINOP_LANE_SIZE_CASE(kArm64ISubSatU, Uqsub);
       SIMD_BINOP_CASE(kArm64I16x8Q15MulRSatS, Sqrdmulh, 8H);
     case kArm64I16x8BitMask: {
-      UseScratchRegisterScope scope(masm());
-      Register dst = i.OutputRegister32();
-      VRegister src = i.InputSimd128Register(0);
-      VRegister tmp = scope.AcquireQ();
-      VRegister mask = scope.AcquireQ();
-
-      __ Sshr(tmp.V8H(), src.V8H(), 15);
-      // Set i-th bit of each lane i. When AND with tmp, the lanes that
-      // are signed will have i-th bit set, unsigned will be 0.
-      __ Movi(mask.V2D(), 0x0080'0040'0020'0010, 0x0008'0004'0002'0001);
-      __ And(tmp.V16B(), mask.V16B(), tmp.V16B());
-      __ Addv(tmp.H(), tmp.V8H());
-      __ Mov(dst.W(), tmp.V8H(), 0);
+      __ I16x8BitMask(i.OutputRegister32(), i.InputSimd128Register(0));
       break;
     }
     case kArm64I8x16Shl: {
@@ -2768,32 +2747,13 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       break;
     }
     case kArm64I8x16BitMask: {
-      UseScratchRegisterScope scope(masm());
-      Register dst = i.OutputRegister32();
-      VRegister src = i.InputSimd128Register(0);
-      VRegister tmp = scope.AcquireQ();
-      VRegister mask = scope.AcquireQ();
-
-      // Set i-th bit of each lane i. When AND with tmp, the lanes that
-      // are signed will have i-th bit set, unsigned will be 0.
-      __ Sshr(tmp.V16B(), src.V16B(), 7);
-      __ Movi(mask.V2D(), 0x8040'2010'0804'0201);
-      __ And(tmp.V16B(), mask.V16B(), tmp.V16B());
-      __ Ext(mask.V16B(), tmp.V16B(), tmp.V16B(), 8);
-      __ Zip1(tmp.V16B(), tmp.V16B(), mask.V16B());
-      __ Addv(tmp.H(), tmp.V8H());
-      __ Mov(dst.W(), tmp.V8H(), 0);
+      __ I8x16BitMask(i.OutputRegister32(), i.InputSimd128Register(0));
       break;
     }
     case kArm64S128Const: {
       uint64_t imm1 = make_uint64(i.InputUint32(1), i.InputUint32(0));
       uint64_t imm2 = make_uint64(i.InputUint32(3), i.InputUint32(2));
       __ Movi(i.OutputSimd128Register().V16B(), imm2, imm1);
-      break;
-    }
-    case kArm64S128Zero: {
-      VRegister dst = i.OutputSimd128Register().V16B();
-      __ Eor(dst, dst, dst);
       break;
     }
       SIMD_BINOP_CASE(kArm64S128And, And, 16B);

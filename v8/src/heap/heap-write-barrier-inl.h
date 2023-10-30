@@ -17,6 +17,7 @@
 #include "src/objects/compressed-slots-inl.h"
 #include "src/objects/fixed-array.h"
 #include "src/objects/heap-object.h"
+#include "src/objects/instruction-stream.h"
 #include "src/objects/maybe-object-inl.h"
 #include "src/objects/slots-inl.h"
 
@@ -24,17 +25,18 @@ namespace v8 {
 namespace internal {
 
 // Defined in heap.cc.
-V8_EXPORT_PRIVATE bool Heap_PageFlagsAreConsistent(HeapObject object);
+V8_EXPORT_PRIVATE bool Heap_PageFlagsAreConsistent(Tagged<HeapObject> object);
 V8_EXPORT_PRIVATE void Heap_CombinedGenerationalAndSharedBarrierSlow(
-    HeapObject object, Address slot, HeapObject value);
+    Tagged<HeapObject> object, Address slot, Tagged<HeapObject> value);
 V8_EXPORT_PRIVATE void Heap_CombinedGenerationalAndSharedEphemeronBarrierSlow(
-    EphemeronHashTable table, Address slot, HeapObject value);
+    Tagged<EphemeronHashTable> table, Address slot, Tagged<HeapObject> value);
 
 V8_EXPORT_PRIVATE void Heap_GenerationalBarrierForCodeSlow(
-    InstructionStream host, RelocInfo* rinfo, HeapObject object);
+    Tagged<InstructionStream> host, RelocInfo* rinfo,
+    Tagged<HeapObject> object);
 
 V8_EXPORT_PRIVATE void Heap_GenerationalEphemeronKeyBarrierSlow(
-    Heap* heap, HeapObject table, Address slot);
+    Heap* heap, Tagged<HeapObject> table, Address slot);
 
 inline bool IsCodeSpaceObject(HeapObject object);
 
@@ -50,7 +52,7 @@ struct MemoryChunk {
   static constexpr uintptr_t kToPageBit = uintptr_t{1} << 4;
   static constexpr uintptr_t kMarkingBit = uintptr_t{1} << 5;
   static constexpr uintptr_t kReadOnlySpaceBit = uintptr_t{1} << 6;
-  static constexpr uintptr_t kIsExecutableBit = uintptr_t{1} << 21;
+  static constexpr uintptr_t kIsExecutableBit = uintptr_t{1} << 19;
 
   V8_INLINE static heap_internals::MemoryChunk* FromHeapObject(
       HeapObject object) {
@@ -243,7 +245,7 @@ inline bool ObjectInYoungGeneration(Object object) {
       ->InYoungGeneration();
 }
 
-inline bool IsReadOnlyHeapObject(HeapObject object) {
+inline bool IsReadOnlyHeapObject(Tagged<HeapObject> object) {
   if (V8_ENABLE_THIRD_PARTY_HEAP_BOOL) return ReadOnlyHeap::Contains(object);
   heap_internals::MemoryChunk* chunk =
       heap_internals::MemoryChunk::FromHeapObject(object);
@@ -344,7 +346,7 @@ void WriteBarrier::CombinedBarrierFromInternalFields(JSObject host, size_t argc,
   }
   MarkingBarrier* marking_barrier = CurrentMarkingBarrier(host);
   if (marking_barrier->is_minor()) {
-    // TODO(v8:13012): We do not currently mark Oilpan objects while MinorMC is
+    // TODO(v8:13012): We do not currently mark Oilpan objects while MinorMS is
     // active. Once Oilpan uses a generational GC with incremental marking and
     // unified heap, this barrier will be needed again.
     return;

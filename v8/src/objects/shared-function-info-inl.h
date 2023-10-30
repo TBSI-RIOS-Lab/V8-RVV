@@ -11,11 +11,16 @@
 #include "src/common/globals.h"
 #include "src/handles/handles-inl.h"
 #include "src/heap/heap-write-barrier-inl.h"
+#include "src/objects/abstract-code-inl.h"
 #include "src/objects/debug-objects-inl.h"
 #include "src/objects/feedback-vector-inl.h"
+#include "src/objects/heap-object-inl.h"
+#include "src/objects/instance-type-inl.h"
+#include "src/objects/objects-inl.h"
 #include "src/objects/scope-info-inl.h"
 #include "src/objects/script-inl.h"
 #include "src/objects/shared-function-info.h"
+#include "src/objects/string.h"
 #include "src/objects/templates-inl.h"
 
 #if V8_ENABLE_WEBASSEMBLY
@@ -49,21 +54,21 @@ void PreparseData::clear_padding() {
   memset(reinterpret_cast<void*>(address() + data_end_offset), 0, padding_size);
 }
 
-byte PreparseData::get(int index) const {
+uint8_t PreparseData::get(int index) const {
   DCHECK_LE(0, index);
   DCHECK_LT(index, data_length());
   int offset = kDataStartOffset + index * kByteSize;
-  return ReadField<byte>(offset);
+  return ReadField<uint8_t>(offset);
 }
 
-void PreparseData::set(int index, byte value) {
+void PreparseData::set(int index, uint8_t value) {
   DCHECK_LE(0, index);
   DCHECK_LT(index, data_length());
   int offset = kDataStartOffset + index * kByteSize;
-  WriteField<byte>(offset, value);
+  WriteField<uint8_t>(offset, value);
 }
 
-void PreparseData::copy_in(int index, const byte* buffer, int length) {
+void PreparseData::copy_in(int index, const uint8_t* buffer, int length) {
   DCHECK(index >= 0 && length >= 0 && length <= kMaxInt - index &&
          index + length <= this->data_length());
   Address dst_addr = field_address(kDataStartOffset + index * kByteSize);
@@ -98,15 +103,19 @@ TQ_OBJECT_CONSTRUCTORS_IMPL(UncompiledDataWithPreparseDataAndJob)
 
 TQ_OBJECT_CONSTRUCTORS_IMPL(InterpreterData)
 TQ_OBJECT_CONSTRUCTORS_IMPL(SharedFunctionInfo)
-NEVER_READ_ONLY_SPACE_IMPL(SharedFunctionInfo)
 DEFINE_DEOPT_ELEMENT_ACCESSORS(SharedFunctionInfo, Object)
 
 RELEASE_ACQUIRE_ACCESSORS(SharedFunctionInfo, function_data, Object,
                           kFunctionDataOffset)
 RELEASE_ACQUIRE_ACCESSORS(SharedFunctionInfo, name_or_scope_info, Object,
                           kNameOrScopeInfoOffset)
-RELEASE_ACQUIRE_ACCESSORS(SharedFunctionInfo, script_or_debug_info, HeapObject,
-                          kScriptOrDebugInfoOffset)
+RELEASE_ACQUIRE_ACCESSORS(SharedFunctionInfo, script, HeapObject, kScriptOffset)
+RELEASE_ACQUIRE_ACCESSORS(SharedFunctionInfo, raw_script, Object, kScriptOffset)
+
+HeapObject SharedFunctionInfo::script() const { return script(kAcquireLoad); }
+HeapObject SharedFunctionInfo::script(PtrComprCageBase cage_base) const {
+  return script(cage_base, kAcquireLoad);
+}
 
 RENAME_TORQUE_ACCESSORS(SharedFunctionInfo,
                         raw_outer_scope_info_or_feedback_metadata,
@@ -186,21 +195,20 @@ void SharedFunctionInfo::SetName(String name) {
 bool SharedFunctionInfo::is_script() const {
   return scope_info(kAcquireLoad).is_script_scope() &&
          Script::cast(script()).compilation_type() ==
-             Script::COMPILATION_TYPE_HOST;
+             Script::CompilationType::kHost;
 }
 
 bool SharedFunctionInfo::needs_script_context() const {
   return is_script() && scope_info(kAcquireLoad).ContextLocalCount() > 0;
 }
 
-template <typename IsolateT>
-AbstractCode SharedFunctionInfo::abstract_code(IsolateT* isolate) {
+AbstractCode SharedFunctionInfo::abstract_code(Isolate* isolate) {
   // TODO(v8:11429): Decide if this return bytecode or baseline code, when the
   // latter is present.
   if (HasBytecodeArray(isolate)) {
     return AbstractCode::cast(GetBytecodeArray(isolate));
   } else {
-    return AbstractCode::cast(GetCode());
+    return AbstractCode::cast(GetCode(isolate));
   }
 }
 
@@ -227,7 +235,7 @@ SharedFunctionInfo::Inlineability SharedFunctionInfo::GetInlineability(
     IsolateT* isolate) const {
   if (!script().IsScript()) return kHasNoScript;
 
-  if (GetIsolate()->is_precise_binary_code_coverage() &&
+  if (isolate->is_precise_binary_code_coverage() &&
       !has_reported_binary_coverage()) {
     // We may miss invocations if this function is inlined.
     return kNeedsBinaryCoverage;
@@ -247,7 +255,13 @@ SharedFunctionInfo::Inlineability SharedFunctionInfo::GetInlineability(
     return kExceedsBytecodeLimit;
   }
 
-  if (HasBreakInfo()) return kMayContainBreakPoints;
+  {
+    SharedMutexGuardIfOffThread<IsolateT, base::kShared> mutex_guard(
+        isolate->shared_function_info_access(), isolate);
+    if (HasBreakInfo(isolate->GetMainThreadIsolateUnsafe())) {
+      return kMayContainBreakPoints;
+    }
+  }
 
   if (optimization_disabled()) return kHasOptimizationDisabled;
 
@@ -364,6 +378,21 @@ void SharedFunctionInfo::CalculateConstructAsBuiltin() {
   set_flags(f, kRelaxedStore);
 }
 
+uint16_t SharedFunctionInfo::age() const {
+  return RELAXED_READ_UINT16_FIELD(*this, kAgeOffset);
+}
+
+void SharedFunctionInfo::set_age(uint16_t value) {
+  RELAXED_WRITE_UINT16_FIELD(*this, kAgeOffset, value);
+}
+
+uint16_t SharedFunctionInfo::CompareExchangeAge(uint16_t expected_age,
+                                                uint16_t new_age) {
+  Address age_addr = address() + kAgeOffset;
+  return base::AsAtomic16::Relaxed_CompareAndSwap(
+      reinterpret_cast<base::Atomic16*>(age_addr), expected_age, new_age);
+}
+
 int SharedFunctionInfo::function_map_index() const {
   // Note: Must be kept in sync with the FastNewClosure builtin.
   int index = Context::FIRST_FUNCTION_MAP_INDEX +
@@ -382,10 +411,7 @@ void SharedFunctionInfo::set_function_map_index(int index) {
             kRelaxedStore);
 }
 
-void SharedFunctionInfo::clear_padding() {
-  memset(reinterpret_cast<void*>(this->address() + kSize), 0,
-         kAlignedSize - kSize);
-}
+void SharedFunctionInfo::clear_padding() { set_padding(0); }
 
 void SharedFunctionInfo::UpdateFunctionMapIndex() {
   int map_index =
@@ -416,6 +442,16 @@ DEF_ACQUIRE_GETTER(SharedFunctionInfo, scope_info, ScopeInfo) {
 
 DEF_GETTER(SharedFunctionInfo, scope_info, ScopeInfo) {
   return scope_info(cage_base, kAcquireLoad);
+}
+
+ScopeInfo SharedFunctionInfo::EarlyScopeInfo(AcquireLoadTag tag) {
+  // Keep in sync with the scope_info getter above.
+  PtrComprCageBase cage_base = GetPtrComprCageBase(*this);
+  Object maybe_scope_info = name_or_scope_info(cage_base, tag);
+  if (maybe_scope_info.IsScopeInfo(cage_base)) {
+    return ScopeInfo::cast(maybe_scope_info);
+  }
+  return EarlyGetReadOnlyRoots().empty_scope_info();
 }
 
 void SharedFunctionInfo::SetScopeInfo(ScopeInfo scope_info,
@@ -564,13 +600,15 @@ DEF_GETTER(SharedFunctionInfo, HasBytecodeArray, bool) {
 
 template <typename IsolateT>
 BytecodeArray SharedFunctionInfo::GetBytecodeArray(IsolateT* isolate) const {
-  // TODO(ishell): access shared_function_info_access() via IsolateT.
   SharedMutexGuardIfOffThread<IsolateT, base::kShared> mutex_guard(
-      GetIsolate()->shared_function_info_access(), isolate);
+      isolate->shared_function_info_access(), isolate);
 
   DCHECK(HasBytecodeArray());
-  if (HasDebugInfo() && GetDebugInfo().HasInstrumentedBytecodeArray()) {
-    return GetDebugInfo().OriginalBytecodeArray();
+
+  base::Optional<DebugInfo> debug_info =
+      TryGetDebugInfo(isolate->GetMainThreadIsolateUnsafe());
+  if (debug_info.has_value() && debug_info->HasInstrumentedBytecodeArray()) {
+    return debug_info->OriginalBytecodeArray();
   }
 
   return GetActiveBytecodeArray();
@@ -608,40 +646,6 @@ void SharedFunctionInfo::set_bytecode_array(BytecodeArray bytecode) {
   DCHECK(function_data(kAcquireLoad) == Smi::FromEnum(Builtin::kCompileLazy) ||
          HasUncompiledData());
   set_function_data(bytecode, kReleaseStore);
-}
-
-bool SharedFunctionInfo::ShouldFlushCode(
-    base::EnumSet<CodeFlushMode> code_flush_mode) {
-  if (IsFlushingDisabled(code_flush_mode)) return false;
-
-  // TODO(rmcilroy): Enable bytecode flushing for resumable functions.
-  if (IsResumableFunction(kind()) || !allows_lazy_compilation()) {
-    return false;
-  }
-
-  // Get a snapshot of the function data field, and if it is a bytecode array,
-  // check if it is old. Note, this is done this way since this function can be
-  // called by the concurrent marker.
-  Object data = function_data(kAcquireLoad);
-  if (data.IsCode()) {
-    Code baseline_code = Code::cast(data);
-    DCHECK_EQ(baseline_code.kind(), CodeKind::BASELINE);
-    // If baseline code flushing isn't enabled and we have baseline data on SFI
-    // we cannot flush baseline / bytecode.
-    if (!IsBaselineCodeFlushingEnabled(code_flush_mode)) return false;
-    data = baseline_code.bytecode_or_interpreter_data();
-  } else if (!IsByteCodeFlushingEnabled(code_flush_mode)) {
-    // If bytecode flushing isn't enabled and there is no baseline code there is
-    // nothing to flush.
-    return false;
-  }
-  if (!data.IsBytecodeArray()) return false;
-
-  if (IsStressFlushingEnabled(code_flush_mode)) return true;
-
-  BytecodeArray bytecode = BytecodeArray::cast(data);
-
-  return bytecode.IsOld();
 }
 
 DEF_GETTER(SharedFunctionInfo, InterpreterTrampoline, Code) {
@@ -872,41 +876,8 @@ void UncompiledData::InitAfterBytecodeFlush(
   set_end_position(end_position);
 }
 
-DEF_GETTER(SharedFunctionInfo, script, HeapObject) {
-  HeapObject maybe_script = script_or_debug_info(cage_base, kAcquireLoad);
-  if (maybe_script.IsDebugInfo(cage_base)) {
-    return DebugInfo::cast(maybe_script).script();
-  }
-  return maybe_script;
-}
-
-void SharedFunctionInfo::set_script(HeapObject script) {
-  HeapObject maybe_debug_info = script_or_debug_info(kAcquireLoad);
-  if (maybe_debug_info.IsDebugInfo()) {
-    DebugInfo::cast(maybe_debug_info).set_script(script);
-  } else {
-    set_script_or_debug_info(script, kReleaseStore);
-  }
-}
-
 bool SharedFunctionInfo::is_repl_mode() const {
   return script().IsScript() && Script::cast(script()).is_repl_mode();
-}
-
-DEF_GETTER(SharedFunctionInfo, HasDebugInfo, bool) {
-  return script_or_debug_info(cage_base, kAcquireLoad).IsDebugInfo(cage_base);
-}
-
-DEF_GETTER(SharedFunctionInfo, GetDebugInfo, DebugInfo) {
-  auto debug_info = script_or_debug_info(cage_base, kAcquireLoad);
-  DCHECK(debug_info.IsDebugInfo(cage_base));
-  return DebugInfo::cast(debug_info);
-}
-
-void SharedFunctionInfo::SetDebugInfo(DebugInfo debug_info) {
-  DCHECK(!HasDebugInfo());
-  DCHECK_EQ(debug_info.script(), script_or_debug_info(kAcquireLoad));
-  set_script_or_debug_info(debug_info, kReleaseStore);
 }
 
 bool SharedFunctionInfo::HasInferredName() {

@@ -17,6 +17,10 @@ All arguments are optional. Most combinations should work, e.g.:
     gm.py android_arm.release.check --progress=verbose
     gm.py x64 mjsunit/foo cctest/test-bar/*
 
+For a less automated experience, pass an existing output directory (which
+must contain an existing args.gn), e.g.:
+    gm.py out/foo unittests
+
 Flags are passed unchanged to the test runner. They must start with -- and must
 not contain spaces.
 """
@@ -141,11 +145,13 @@ TESTSUITES_TARGETS = {
 OUTDIR = Path("out")
 
 
+# Note: this function is reused by update-compile-commands.py. When renaming
+# this, please update that file too!
 def detect_goma():
   if os.environ.get("GOMA_DIR"):
-    return os.environ.get("GOMA_DIR")
+    return Path(os.environ.get("GOMA_DIR"))
   if os.environ.get("GOMADIR"):
-    return os.environ.get("GOMADIR")
+    return Path(os.environ.get("GOMADIR"))
   # There is a copy of goma in depot_tools, but it might not be in use on
   # this machine.
   goma = shutil.which("goma_ctl")
@@ -153,10 +159,14 @@ def detect_goma():
   cipd_bin = Path(goma).parent / ".cipd_bin"
   if not cipd_bin.exists():
     return None
+  # Some machines have one of these files, some have the other, some have both.
   goma_auth = Path("~/.goma_client_oauth2_config").expanduser()
-  if not goma_auth.exists():
-    return None
-  return cipd_bin
+  if goma_auth.exists():
+    return cipd_bin
+  goma_auth = Path("~/.goma_oauth2_config").expanduser()
+  if goma_auth.exists():
+    return cipd_bin
+  return None
 
 
 GOMADIR = detect_goma()
@@ -176,7 +186,7 @@ v8_enable_verify_heap = true
 dcheck_always_on = false
 """
 
-DEBUG_ARGS_TEMPLATE = """\
+DEBUG_ARGS_TEMPLATE = f"""\
 is_component_build = true
 is_debug = true
 symbol_level = 2
@@ -296,16 +306,18 @@ def prepare_mksnapshot_cmdline(orig_cmdline, path):
       result += f"{w} "
   return result
 
-class Config(object):
-  def __init__(self,
-               arch,
-               mode,
-               targets,
-               tests=[],
-               clean=False,
-               testrunner_args=[]):
-    self.arch = arch
-    self.mode = mode
+
+def prepare_torque_cmdline(orig_cmdline: str, path):
+  torque_bin = path / "torque"
+  args = orig_cmdline.replace("-v8-root ../..", "-v8-root .")
+  args = args.replace("gen/torque-generated", f"{path}/gen/torque-generated")
+  return f"gdb --args {torque_bin} {args}"
+
+# Only has a path, assumes that the path (and args.gn in it) already exists.
+class RawConfig:
+
+  def __init__(self, path, targets, tests=[], clean=False, testrunner_args=[]):
+    self.path = path
     self.targets = set(targets)
     self.tests = set(tests)
     self.testrunner_args = testrunner_args
@@ -315,6 +327,83 @@ class Config(object):
     self.targets.update(targets)
     self.tests.update(tests)
     self.clean |= clean
+
+  def build(self):
+    build_ninja = self.path / "build.ninja"
+    if not build_ninja.exists():
+      code = _call(f"gn gen {self.path}")
+      if code != 0:
+        return code
+    elif self.clean:
+      code = _call(f"gn clean {self.path}")
+      if code != 0:
+        return code
+    targets = " ".join(self.targets)
+    # The implementation of mksnapshot failure detection relies on
+    # the "pty" module and GDB presence, so skip it on non-Linux.
+    if not USE_PTY:
+      return _call(f"autoninja -C {self.path} {targets}")
+
+    return_code, output = _call_with_output(
+        f"autoninja -C {self.path} {targets}")
+    if return_code != 0 and "FAILED:" in output:
+      if "snapshot_blob" in output:
+        if "gen-static-roots.py" in output:
+          _notify("V8 build requires your attention",
+                  "Please re-generate static roots...")
+          return return_code
+        csa_trap = re.compile("Specify option( --csa-trap-on-node=[^ ]*)")
+        match = csa_trap.search(output)
+        extra_opt = match.group(1) if match else ""
+        cmdline = re.compile("python3 ../../tools/run.py ./mksnapshot (.*)")
+        orig_cmdline = cmdline.search(output).group(1).strip()
+        cmdline = (
+            prepare_mksnapshot_cmdline(orig_cmdline, self.path) + extra_opt)
+        _notify("V8 build requires your attention",
+                "Detected mksnapshot failure, re-running in GDB...")
+        _call(cmdline)
+      elif "run.py ./torque" in output and not ": Torque Error: " in output:
+        # Torque failed/crashed without printing an error message.
+        cmdline = re.compile("python3 ../../tools/run.py ./torque (.*)")
+        orig_cmdline = cmdline.search(output).group(1).strip()
+        cmdline = f"gdb --args "
+        cmdline = prepare_torque_cmdline(orig_cmdline, self.path)
+        _notify("V8 build requires your attention",
+                "Detecting torque failure, re-running in GDB...")
+        _call(cmdline)
+    return return_code
+
+  def run_tests(self):
+    if not self.tests:
+      return 0
+    if "ALL" in self.tests:
+      tests = ""
+    else:
+      tests = " ".join(self.tests)
+    run_tests = Path("tools") / "run-tests.py"
+    test_runner_args = " ".join(self.testrunner_args)
+    return _call(
+        f'"{sys.executable }" {run_tests} --outdir={self.path} {tests} {test_runner_args}'
+    )
+
+
+# Contrary to RawConfig, takes arch and mode, and sets everything up
+# automatically.
+# Note: This class is imported by update-compile-commands.py. When renaming
+# anything here, please update that script too!
+class ManagedConfig(RawConfig):
+
+  def __init__(self,
+               arch,
+               mode,
+               targets,
+               tests=[],
+               clean=False,
+               testrunner_args=[]):
+    super().__init__(
+        get_path(arch, mode), targets, tests, clean, testrunner_args)
+    self.arch = arch
+    self.mode = mode
 
   def get_target_cpu(self):
     cpu = "x86"
@@ -378,60 +467,22 @@ class Config(object):
     return template % "\n".join(arch_specific)
 
   def build(self):
-    path = get_path(self.arch, self.mode)
+    path = self.path
     args_gn = path / "args.gn"
-    build_ninja = path / "build.ninja"
     if not path.exists():
       print(f"# mkdir -p {path}")
       path.mkdir(parents=True)
     if not args_gn.exists():
       _write(args_gn, self.get_gn_args())
-    if not build_ninja.exists():
-      code = _call(f"gn gen {path}")
-      if code != 0: return code
-    elif self.clean:
-      code = _call(f"gn clean {path}")
-      if code != 0: return code
-    targets = " ".join(self.targets)
-    # The implementation of mksnapshot failure detection relies on
-    # the "pty" module and GDB presence, so skip it on non-Linux.
-    if not USE_PTY:
-      return _call(f"autoninja -C {path} {targets}")
-
-    return_code, output = _call_with_output(f"autoninja -C {path} {targets}")
-    if return_code != 0 and "FAILED:" in output and "snapshot_blob" in output:
-      if "gen-static-roots.py" in output:
-        _notify("V8 build requires your attention",
-                "Please re-generate static roots...")
-        return return_code
-      csa_trap = re.compile("Specify option( --csa-trap-on-node=[^ ]*)")
-      match = csa_trap.search(output)
-      extra_opt = match.group(1) if match else ""
-      cmdline = re.compile("python3 ../../tools/run.py ./mksnapshot (.*)")
-      orig_cmdline = cmdline.search(output).group(1).strip()
-      cmdline = prepare_mksnapshot_cmdline(orig_cmdline, path) + extra_opt
-      _notify("V8 build requires your attention",
-              "Detected mksnapshot failure, re-running in GDB...")
-      _call(cmdline)
-    return return_code
+    return super().build()
 
   def run_tests(self):
     # Special handling for "mkgrokdump": if it was built, run it.
-    build_dir = get_path(self.arch, self.mode)
     if (self.arch == "x64" and self.mode == "release" and
         "mkgrokdump" in self.targets):
-      mkgrokdump_bin = build_dir / "mkgrokdump"
+      mkgrokdump_bin = self.path / "mkgrokdump"
       _call(f"{mkgrokdump_bin} > tools/v8heapconst.py")
-    if not self.tests: return 0
-    if "ALL" in self.tests:
-      tests = ""
-    else:
-      tests = " ".join(self.tests)
-    run_tests = Path("tools") / "run-tests.py"
-    test_runner_args = " ".join(self.testrunner_args)
-    return _call(
-        f'"{sys.executable }" {run_tests} --outdir={build_dir} {tests} {test_runner_args}'
-    )
+    return super().run_tests()
 
 
 def get_test_binary(argstring):
@@ -452,8 +503,8 @@ class ArgumentParser(object):
       for m in modes:
         path = get_path(a, m)
         if path not in self.configs:
-          self.configs[path] = Config(a, m, targets, tests, clean,
-                  self.testrunner_args)
+          self.configs[path] = ManagedConfig(a, m, targets, tests, clean,
+                                             self.testrunner_args)
         else:
           self.configs[path].extend(targets, tests)
 
@@ -466,6 +517,47 @@ class ArgumentParser(object):
           self.configs[c].extend(**impact)
       else:
         self.populate_configs(DEFAULT_ARCHES, DEFAULT_MODES, **impact)
+
+  def maybe_parse_builddir(self, argstring):
+    outdir_prefix = str(OUTDIR) + os.path.sep
+    # {argstring} must have the shape "out/x", and the 'x' part must be
+    # at least one character.
+    if not argstring.startswith(outdir_prefix):
+      return False
+    if len(argstring) <= len(outdir_prefix):
+      return False
+    # "out/foo.d8" -> path="out/foo", targets=["d8"]
+    # "out/d8.cctest" -> path="out/d8", targets=["cctest"]
+    # "out/x.y.d8.cctest" -> path="out/x.y", targets=["d8", "cctest"]
+    words = argstring.split('.')
+    path_end = len(words)
+    targets = []
+    tests = []
+    clean = False
+    while path_end > 1:
+      w = words[path_end - 1]
+      maybe_target = get_test_binary(w)
+      if w in TARGETS:
+        targets.append(w)
+      elif maybe_target is not None:
+        targets.append(maybe_target)
+        tests.append(w)
+      elif w == 'clean':
+        clean = True
+      else:
+        break
+      path_end -= 1
+    path = Path('.'.join(words[:path_end]))
+    args_gn = path / "args.gn"
+    # Only accept existing build output directories, otherwise fall back
+    # to regular parsing.
+    if not args_gn.is_file():
+      return False
+    if path not in self.configs:
+      self.configs[path] = RawConfig(path, targets, tests, clean)
+    else:
+      self.configs[path].extend(targets, tests, clean)
+    return True
 
   def parse_arg(self, argstring):
     if argstring in ("-h", "--help", "help"):
@@ -482,14 +574,17 @@ class ArgumentParser(object):
     if argstring == "mkgrokdump":
       self.populate_configs(["x64"], ["release"], ["mkgrokdump"], [], False)
       return
+    if argstring.startswith("--"):
+      # Pass all other flags to test runner.
+      self.testrunner_args.append(argstring)
+      return
+    # Specifying a directory like "out/foo" enters "manual mode".
+    if self.maybe_parse_builddir(argstring):
+      return
     # Specifying a single unit test looks like "unittests/Foo.Bar", test262
     # tests have names like "S15.4.4.7_A4_T1", don't split these.
     if argstring.startswith("unittests/") or argstring.startswith("test262/"):
       words = [argstring]
-    elif argstring.startswith("--"):
-      # Pass all other flags to test runner.
-      self.testrunner_args.append(argstring)
-      return
     else:
       # Assume it's a word like "x64.release" -> split at the dot.
       words = argstring.split('.')

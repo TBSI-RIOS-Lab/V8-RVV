@@ -174,7 +174,6 @@ var assertMatches;
 var assertPromiseResult;
 
 var promiseTestChain;
-var promiseTestCount = 0;
 
 // These bits must be in sync with bits defined in Runtime_GetOptimizationStatus
 var V8OptimizationStatus = {
@@ -198,6 +197,7 @@ var V8OptimizationStatus = {
   kTopmostFrameIsBaseline: 1 << 17,
   kIsLazy: 1 << 18,
   kTopmostFrameIsMaglev: 1 << 19,
+  kOptimizeOnNextCallOptimizesToMaglev: 1 << 20,
 };
 
 // Returns true if --lite-mode is on and we can't ever turn on optimization.
@@ -223,6 +223,12 @@ var isUnoptimized;
 
 // Returns true if given function is optimized.
 var isOptimized;
+
+// Returns true if given function will be compiled by Maglev.
+var willBeMaglevved;
+
+// Returns true if given function will be compiled by TurboFan.
+var willBeTurbofanned;
 
 // Returns true if given function is compiled by Maglev.
 var isMaglevved;
@@ -325,14 +331,17 @@ var prettyPrinted;
                     });
                 var joined = ArrayPrototypeJoin.call(mapped, ",");
                 return "[" + joined + "]";
-              case "Uint8Array":
               case "Int8Array":
+              case "Uint8Array":
+              case "Uint8ClampedArray":
               case "Int16Array":
               case "Uint16Array":
-              case "Uint32Array":
               case "Int32Array":
+              case "Uint32Array":
               case "Float32Array":
               case "Float64Array":
+              case "BigInt64Array":
+              case "BigUint64Array":
                 var joined = ArrayPrototypeJoin.call(value, ",");
                 return objectClass + "([" + joined + "])";
               case "Object":
@@ -406,7 +415,6 @@ var prettyPrinted;
     return true;
   }
 
-
   deepEquals = function deepEquals(a, b) {
     if (a === b) {
       // Check for -0.
@@ -414,33 +422,53 @@ var prettyPrinted;
       return true;
     }
     if (typeof a !== typeof b) return false;
-    if (typeof a === "number") return isNaN(a) && isNaN(b);
-    if (typeof a !== "object" && typeof a !== "function") return false;
+    if (typeof a === 'number') return isNaN(a) && isNaN(b);
+    if (typeof a !== 'object' && typeof a !== 'function') return false;
     // Neither a nor b is primitive.
     var objectClass = classOf(a);
     if (objectClass !== classOf(b)) return false;
-    if (objectClass === "RegExp") {
-      // For RegExp, just compare pattern and flags using its toString.
-      return RegExpPrototypeToString.call(a) ===
-             RegExpPrototypeToString.call(b);
-    }
-    // Functions are only identical to themselves.
-    if (objectClass === "Function") return false;
-    if (objectClass === "Array") {
-      var elementCount = 0;
-      if (a.length !== b.length) {
+    switch (objectClass) {
+      case 'RegExp':
+        // For RegExp, just compare pattern and flags using its toString.
+        return RegExpPrototypeToString.call(a) ===
+            RegExpPrototypeToString.call(b);
+      case 'Function':
+        // Functions are only identical to themselves.
         return false;
-      }
-      for (var i = 0; i < a.length; i++) {
-        if ((i in a) !== (i in b)) return false;
-        if (!deepEquals(a[i], b[i])) return false;
-      }
-      return true;
-    }
-    if (objectClass === "String" || objectClass === "Number" ||
-      objectClass === "BigInt" || objectClass === "Boolean" ||
-      objectClass === "Date") {
-      if (ValueOf(a) !== ValueOf(b)) return false;
+      case 'Array':
+        if (a.length !== b.length) return false;
+        for (var i = 0; i < a.length; i++) {
+          if ((i in a) !== (i in b)) return false;
+          if (!deepEquals(a[i], b[i])) return false;
+        }
+        return true;
+      case 'Int8Array':
+      case 'Uint8Array':
+      case 'Uint8ClampedArray':
+      case 'Int16Array':
+      case 'Uint16Array':
+      case 'Int32Array':
+      case 'Uint32Array':
+      case 'BigInt64Array':
+      case 'BigUint64Array':
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+          if (a[i] !== b[i]) return false;
+        }
+        return true;
+      case 'Float32Array':
+      case 'Float64Array':
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+          if (!deepEquals(a[i], b[i])) return false;
+        }
+        return true;
+      case 'String':
+      case 'Number':
+      case 'BigInt':
+      case 'Boolean':
+      case 'Date':
+        return ValueOf(a) === ValueOf(b);
     }
     return deepObjectEquals(a, b);
   }
@@ -688,7 +716,6 @@ var prettyPrinted;
     var test_promise = promise.then(
         result => {
           try {
-            if (--promiseTestCount == 0) testRunner.notifyDone();
             if (success !== undefined) success(result);
           } catch (e) {
             // Use setTimeout to throw the error again to get out of the promise
@@ -700,7 +727,6 @@ var prettyPrinted;
         },
         result => {
           try {
-            if (--promiseTestCount == 0) testRunner.notifyDone();
             if (fail === undefined) throw result;
             fail(result);
           } catch (e) {
@@ -713,9 +739,6 @@ var prettyPrinted;
         });
 
     if (!promiseTestChain) promiseTestChain = Promise.resolve();
-    // waitUntilDone is idempotent.
-    testRunner.waitUntilDone();
-    ++promiseTestCount;
     return promiseTestChain.then(test_promise);
   };
 
@@ -750,7 +773,16 @@ var prettyPrinted;
       return;
     }
     var is_optimized = (opt_status & V8OptimizationStatus.kOptimized) !== 0;
-    assertFalse(is_optimized, name_opt);
+    if (is_optimized && (opt_status & V8OptimizationStatus.kMaglevved) &&
+        (opt_status &
+         V8OptimizationStatus.kOptimizeOnNextCallOptimizesToMaglev)) {
+      // When --optimize-on-next-call-optimizes-to-maglev is used, we might emit
+      // more generic code than optimization tests expect. In such cases,
+      // assertUnoptimized may see optimized code, but we still want it to
+      // succeed and continue the test.
+      return;
+    }
+    assertFalse(is_optimized, 'should not be optimized: ' + name_opt);
   }
 
   assertOptimized = function assertOptimized(
@@ -837,6 +869,20 @@ var prettyPrinted;
                "not a function");
     return (opt_status & V8OptimizationStatus.kOptimized) !== 0 &&
            (opt_status & V8OptimizationStatus.kMaglevved) !== 0;
+  }
+
+  willBeMaglevved = function willBeMaglevved(fun) {
+    var opt_status = OptimizationStatus(fun, "");
+    assertTrue((opt_status & V8OptimizationStatus.kIsFunction) !== 0,
+               "not a function");
+    return (opt_status & V8OptimizationStatus.kOptimizeOnNextCallOptimizesToMaglev) !== 0;
+  }
+
+  willBeTurbofanned = function willBeTurbofanned(fun) {
+    var opt_status = OptimizationStatus(fun, "");
+    assertTrue((opt_status & V8OptimizationStatus.kIsFunction) !== 0,
+               "not a function");
+    return (opt_status & V8OptimizationStatus.kOptimizeOnNextCallOptimizesToMaglev) === 0;
   }
 
   isTurboFanned = function isTurboFanned(fun) {

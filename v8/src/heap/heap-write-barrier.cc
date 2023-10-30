@@ -132,7 +132,7 @@ int WriteBarrier::SharedMarkingFromCode(Address raw_host, Address raw_slot) {
 
 #if DEBUG
   Heap* heap = MemoryChunk::FromHeapObject(host)->heap();
-  DCHECK(heap->incremental_marking()->IsMarking());
+  DCHECK(heap->incremental_marking()->IsMajorMarking());
   Isolate* isolate = heap->isolate();
   DCHECK(isolate->is_shared_space_isolate());
 
@@ -164,17 +164,7 @@ int WriteBarrier::SharedFromCode(Address raw_host, Address raw_slot) {
 bool WriteBarrier::IsImmortalImmovableHeapObject(HeapObject object) {
   BasicMemoryChunk* basic_chunk = BasicMemoryChunk::FromHeapObject(object);
   // All objects in readonly space are immortal and immovable.
-  if (basic_chunk->InReadOnlySpace()) return true;
-  MemoryChunk* chunk = MemoryChunk::FromHeapObject(object);
-  // There are also objects in "regular" spaces which are immortal and
-  // immovable. Objects on a page that can get compacted are movable and can be
-  // filtered out.
-  if (!chunk->IsFlagSet(MemoryChunk::NEVER_EVACUATE)) return false;
-  // Builtins don't have InstructionStream objects (instead, they point
-  // directly into off-heap code streams).
-  DCHECK_IMPLIES(object.IsInstructionStream(),
-                 !InstructionStream::cast(object).is_builtin());
-  return false;
+  return basic_chunk->InReadOnlySpace();
 }
 #endif
 

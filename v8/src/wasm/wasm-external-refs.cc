@@ -459,8 +459,9 @@ class V8_NODISCARD ThreadNotInWasmScope {
 #endif
 };
 
-inline byte* EffectiveAddress(WasmInstanceObject instance, uintptr_t index) {
-  return instance.memory_start() + index;
+inline uint8_t* EffectiveAddress(WasmInstanceObject instance,
+                                 uint32_t mem_index, uintptr_t index) {
+  return instance.memory_base(mem_index) + index;
 }
 
 template <typename V>
@@ -478,22 +479,24 @@ int32_t memory_init_wrapper(Address data) {
   ThreadNotInWasmScope thread_not_in_wasm_scope;
   DisallowGarbageCollection no_gc;
   size_t offset = 0;
-  Object raw_instance = ReadAndIncrementOffset<Object>(data, &offset);
-  WasmInstanceObject instance = WasmInstanceObject::cast(raw_instance);
+  WasmInstanceObject instance =
+      WasmInstanceObject::cast(ReadAndIncrementOffset<Object>(data, &offset));
+  uint32_t mem_index = ReadAndIncrementOffset<uint32_t>(data, &offset);
   uintptr_t dst = ReadAndIncrementOffset<uintptr_t>(data, &offset);
   uint32_t src = ReadAndIncrementOffset<uint32_t>(data, &offset);
   uint32_t seg_index = ReadAndIncrementOffset<uint32_t>(data, &offset);
   uint32_t size = ReadAndIncrementOffset<uint32_t>(data, &offset);
 
-  uint64_t mem_size = instance.memory_size();
+  uint64_t mem_size = instance.memory_size(mem_index);
   if (!base::IsInBounds<uint64_t>(dst, size, mem_size)) return kOutOfBounds;
 
   uint32_t seg_size = instance.data_segment_sizes().get(seg_index);
   if (!base::IsInBounds<uint32_t>(src, size, seg_size)) return kOutOfBounds;
 
-  byte* seg_start =
-      reinterpret_cast<byte*>(instance.data_segment_starts().get(seg_index));
-  std::memcpy(EffectiveAddress(instance, dst), seg_start + src, size);
+  uint8_t* seg_start =
+      reinterpret_cast<uint8_t*>(instance.data_segment_starts().get(seg_index));
+  std::memcpy(EffectiveAddress(instance, mem_index, dst), seg_start + src,
+              size);
   return kSuccess;
 }
 
@@ -501,19 +504,22 @@ int32_t memory_copy_wrapper(Address data) {
   ThreadNotInWasmScope thread_not_in_wasm_scope;
   DisallowGarbageCollection no_gc;
   size_t offset = 0;
-  Object raw_instance = ReadAndIncrementOffset<Object>(data, &offset);
-  WasmInstanceObject instance = WasmInstanceObject::cast(raw_instance);
+  WasmInstanceObject instance =
+      WasmInstanceObject::cast(ReadAndIncrementOffset<Object>(data, &offset));
+  uint32_t dst_mem_index = ReadAndIncrementOffset<uint32_t>(data, &offset);
+  uint32_t src_mem_index = ReadAndIncrementOffset<uint32_t>(data, &offset);
   uintptr_t dst = ReadAndIncrementOffset<uintptr_t>(data, &offset);
   uintptr_t src = ReadAndIncrementOffset<uintptr_t>(data, &offset);
   uintptr_t size = ReadAndIncrementOffset<uintptr_t>(data, &offset);
 
-  uint64_t mem_size = instance.memory_size();
-  if (!base::IsInBounds<uint64_t>(dst, size, mem_size)) return kOutOfBounds;
-  if (!base::IsInBounds<uint64_t>(src, size, mem_size)) return kOutOfBounds;
+  uint64_t dst_mem_size = instance.memory_size(dst_mem_index);
+  uint64_t src_mem_size = instance.memory_size(src_mem_index);
+  if (!base::IsInBounds<uint64_t>(dst, size, dst_mem_size)) return kOutOfBounds;
+  if (!base::IsInBounds<uint64_t>(src, size, src_mem_size)) return kOutOfBounds;
 
   // Use std::memmove, because the ranges can overlap.
-  std::memmove(EffectiveAddress(instance, dst), EffectiveAddress(instance, src),
-               size);
+  std::memmove(EffectiveAddress(instance, dst_mem_index, dst),
+               EffectiveAddress(instance, src_mem_index, src), size);
   return kSuccess;
 }
 
@@ -522,17 +528,18 @@ int32_t memory_fill_wrapper(Address data) {
   DisallowGarbageCollection no_gc;
 
   size_t offset = 0;
-  Object raw_instance = ReadAndIncrementOffset<Object>(data, &offset);
-  WasmInstanceObject instance = WasmInstanceObject::cast(raw_instance);
+  WasmInstanceObject instance =
+      WasmInstanceObject::cast(ReadAndIncrementOffset<Object>(data, &offset));
+  uint32_t mem_index = ReadAndIncrementOffset<uint32_t>(data, &offset);
   uintptr_t dst = ReadAndIncrementOffset<uintptr_t>(data, &offset);
   uint8_t value =
       static_cast<uint8_t>(ReadAndIncrementOffset<uint32_t>(data, &offset));
   uintptr_t size = ReadAndIncrementOffset<uintptr_t>(data, &offset);
 
-  uint64_t mem_size = instance.memory_size();
+  uint64_t mem_size = instance.memory_size(mem_index);
   if (!base::IsInBounds<uint64_t>(dst, size, mem_size)) return kOutOfBounds;
 
-  std::memset(EffectiveAddress(instance, dst), value, size);
+  std::memset(EffectiveAddress(instance, mem_index, dst), value, size);
   return kSuccess;
 }
 
@@ -636,6 +643,7 @@ void array_fill_wrapper(Address raw_array, uint32_t index, uint32_t length,
       break;
     }
     case kRefNull:
+    case kRef:
       if constexpr (kTaggedSize == 4) {
         int32_t* base = reinterpret_cast<int32_t*>(initial_element_address);
         base[0] = base[1] = static_cast<int32_t>(initial_value);
@@ -645,7 +653,6 @@ void array_fill_wrapper(Address raw_array, uint32_t index, uint32_t length,
       break;
     case kS128:
     case kRtt:
-    case kRef:
     case kVoid:
     case kBottom:
       UNREACHABLE();
@@ -673,6 +680,12 @@ void array_fill_wrapper(Address raw_array, uint32_t index, uint32_t length,
         reinterpret_cast<Address>(initial_element_address + bytes_to_set));
     isolate->heap()->WriteBarrierForRange(array, start, end);
   }
+}
+
+double flat_string_to_f64(Address string_address) {
+  String s = String::cast(Object(string_address));
+  return FlatStringToDouble(s, ALLOW_TRAILING_JUNK,
+                            std::numeric_limits<double>::quiet_NaN());
 }
 
 static WasmTrapCallbackForTesting wasm_trap_callback_for_testing = nullptr;

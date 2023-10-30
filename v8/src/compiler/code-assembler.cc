@@ -238,8 +238,16 @@ TNode<Int32T> CodeAssembler::Int32Constant(int32_t value) {
   return UncheckedCast<Int32T>(jsgraph()->Int32Constant(value));
 }
 
+TNode<Int64T> CodeAssembler::UniqueInt64Constant(int64_t value) {
+  return UncheckedCast<Int64T>(jsgraph()->UniqueInt64Constant(value));
+}
+
 TNode<Int64T> CodeAssembler::Int64Constant(int64_t value) {
   return UncheckedCast<Int64T>(jsgraph()->Int64Constant(value));
+}
+
+TNode<IntPtrT> CodeAssembler::UniqueIntPtrConstant(intptr_t value) {
+  return UncheckedCast<IntPtrT>(jsgraph()->UniqueIntPtrConstant(value));
 }
 
 TNode<IntPtrT> CodeAssembler::IntPtrConstant(intptr_t value) {
@@ -285,9 +293,9 @@ TNode<String> CodeAssembler::StringConstant(const char* str) {
   return UncheckedCast<String>(HeapConstant(internalized_string));
 }
 
-TNode<Oddball> CodeAssembler::BooleanConstant(bool value) {
-  Handle<Object> object = isolate()->factory()->ToBoolean(value);
-  return UncheckedCast<Oddball>(
+TNode<Boolean> CodeAssembler::BooleanConstant(bool value) {
+  Handle<Boolean> object = isolate()->factory()->ToBoolean(value);
+  return UncheckedCast<Boolean>(
       jsgraph()->HeapConstant(Handle<HeapObject>::cast(object)));
 }
 
@@ -485,6 +493,12 @@ void CodeAssembler::PopAndReturn(Node* pop, Node* value) {
   return raw_assembler()->PopAndReturn(pop, value);
 }
 
+void CodeAssembler::PopAndReturn(Node* pop, Node* value1, Node* value2,
+                                 Node* value3, Node* value4) {
+  DCHECK_EQ(4, raw_assembler()->call_descriptor()->ReturnCount());
+  return raw_assembler()->PopAndReturn(pop, value1, value2, value3, value4);
+}
+
 void CodeAssembler::ReturnIf(TNode<BoolT> condition, TNode<Object> value) {
   Label if_return(this), if_continue(this);
   Branch(condition, &if_return, &if_continue);
@@ -545,6 +559,16 @@ TNode<RawPtrT> CodeAssembler::LoadFramePointer() {
 
 TNode<RawPtrT> CodeAssembler::LoadParentFramePointer() {
   return UncheckedCast<RawPtrT>(raw_assembler()->LoadParentFramePointer());
+}
+
+TNode<RawPtrT> CodeAssembler::LoadPointerFromRootRegister(
+    TNode<IntPtrT> offset) {
+  return UncheckedCast<RawPtrT>(
+      Load(MachineType::IntPtr(), raw_assembler()->LoadRootRegister(), offset));
+}
+
+TNode<RawPtrT> CodeAssembler::StackSlotPtr(int size, int alignment) {
+  return UncheckedCast<RawPtrT>(raw_assembler()->StackSlot(size, alignment));
 }
 
 #define DEFINE_CODE_ASSEMBLER_BINARY_OP(name, ResType, Arg1Type, Arg2Type)   \
@@ -1315,7 +1339,8 @@ void CodeAssembler::Branch(TNode<BoolT> condition,
 void CodeAssembler::Switch(Node* index, Label* default_label,
                            const int32_t* case_values, Label** case_labels,
                            size_t case_count) {
-  RawMachineLabel** labels = zone()->NewArray<RawMachineLabel*>(case_count);
+  RawMachineLabel** labels =
+      zone()->AllocateArray<RawMachineLabel*>(case_count);
   for (size_t i = 0; i < case_count; ++i) {
     labels[i] = case_labels[i]->label_;
     case_labels[i]->MergeVariables();

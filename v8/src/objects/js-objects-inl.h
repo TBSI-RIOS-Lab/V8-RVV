@@ -7,20 +7,25 @@
 
 #include "src/common/globals.h"
 #include "src/heap/heap-write-barrier.h"
+#include "src/objects/dictionary.h"
 #include "src/objects/elements.h"
 #include "src/objects/embedder-data-slot-inl.h"
 #include "src/objects/feedback-vector.h"
 #include "src/objects/field-index-inl.h"
+#include "src/objects/fixed-array.h"
 #include "src/objects/hash-table-inl.h"
 #include "src/objects/heap-number-inl.h"
+#include "src/objects/instance-type-inl.h"
 #include "src/objects/js-objects.h"
 #include "src/objects/keys.h"
 #include "src/objects/lookup-inl.h"
+#include "src/objects/primitive-heap-object.h"
 #include "src/objects/property-array-inl.h"
 #include "src/objects/prototype-inl.h"
 #include "src/objects/shared-function-info.h"
 #include "src/objects/slots.h"
 #include "src/objects/smi-inl.h"
+#include "src/objects/string.h"
 #include "src/objects/swiss-name-dictionary-inl.h"
 
 // Has to be the last include (doesn't have include guards):
@@ -129,13 +134,13 @@ bool JSObject::PrototypeHasNoElements(Isolate* isolate, JSObject object) {
   HeapObject prototype = HeapObject::cast(object.map().prototype());
   ReadOnlyRoots roots(isolate);
   HeapObject null = roots.null_value();
-  FixedArrayBase empty_fixed_array = roots.empty_fixed_array();
-  FixedArrayBase empty_slow_element_dictionary =
+  Tagged<FixedArrayBase> empty_fixed_array = roots.empty_fixed_array();
+  Tagged<FixedArrayBase> empty_slow_element_dictionary =
       roots.empty_slow_element_dictionary();
   while (prototype != null) {
     Map map = prototype.map();
     if (map.IsCustomElementsReceiverMap()) return false;
-    FixedArrayBase elements = JSObject::cast(prototype).elements();
+    Tagged<FixedArrayBase> elements = JSObject::cast(prototype).elements();
     if (elements != empty_fixed_array &&
         elements != empty_slow_element_dictionary) {
       return false;
@@ -253,7 +258,7 @@ void JSObject::SetMapAndElements(Handle<JSObject> object, Handle<Map> new_map,
 }
 
 void JSObject::initialize_elements() {
-  FixedArrayBase elements = map().GetInitialElements();
+  Tagged<FixedArrayBase> elements = map().GetInitialElements();
   set_elements(elements, SKIP_WRITE_BARRIER);
 }
 
@@ -477,21 +482,22 @@ void JSObject::WriteToField(InternalIndex descriptor, PropertyDetails details,
   }
 }
 
-Object JSObject::RawFastPropertyAtSwap(FieldIndex index, Object value,
-                                       SeqCstAccessTag tag) {
-  PtrComprCageBase cage_base = GetPtrComprCageBase(*this);
-  return RawFastPropertyAtSwap(cage_base, index, value, tag);
+Object JSObject::RawFastInobjectPropertyAtSwap(FieldIndex index, Object value,
+                                               SeqCstAccessTag tag) {
+  DCHECK(index.is_inobject());
+  DCHECK(value.IsShared());
+  int offset = index.offset();
+  Object old_value = SEQ_CST_SWAP_FIELD(*this, offset, value);
+  CONDITIONAL_WRITE_BARRIER(*this, offset, value, UPDATE_WRITE_BARRIER);
+  return old_value;
 }
 
-Object JSObject::RawFastPropertyAtSwap(PtrComprCageBase cage_base,
-                                       FieldIndex index, Object value,
+Object JSObject::RawFastPropertyAtSwap(FieldIndex index, Object value,
                                        SeqCstAccessTag tag) {
   if (index.is_inobject()) {
-    return TaggedField<Object>::SeqCst_Swap(cage_base, *this, index.offset(),
-                                            value);
+    return RawFastInobjectPropertyAtSwap(index, value, tag);
   }
-  return property_array().Swap(cage_base, index.outobject_array_index(), value,
-                               tag);
+  return property_array().Swap(index.outobject_array_index(), value, tag);
 }
 
 int JSObject::GetInObjectPropertyOffset(int index) {
@@ -578,16 +584,28 @@ DEF_GETTER(JSGlobalObject, native_context_unchecked, Object) {
 }
 
 bool JSMessageObject::DidEnsureSourcePositionsAvailable() const {
-  return shared_info().IsUndefined();
+  return shared_info() == Smi::zero();
+}
+
+// static
+void JSMessageObject::EnsureSourcePositionsAvailable(
+    Isolate* isolate, Handle<JSMessageObject> message) {
+  if (message->DidEnsureSourcePositionsAvailable()) {
+    DCHECK(message->script().has_line_ends());
+  } else {
+    JSMessageObject::InitializeSourcePositions(isolate, message);
+  }
 }
 
 int JSMessageObject::GetStartPosition() const {
-  DCHECK(DidEnsureSourcePositionsAvailable());
+  // TODO(cbruni): make this DCHECK stricter (>= 0).
+  DCHECK_LE(-1, start_position());
   return start_position();
 }
 
 int JSMessageObject::GetEndPosition() const {
-  DCHECK(DidEnsureSourcePositionsAvailable());
+  // TODO(cbruni): make this DCHECK stricter (>= 0).
+  DCHECK_LE(-1, end_position());
   return end_position();
 }
 
@@ -599,7 +617,7 @@ void JSMessageObject::set_type(MessageTemplate value) {
   set_raw_type(static_cast<int>(value));
 }
 
-ACCESSORS(JSMessageObject, shared_info, HeapObject, kSharedInfoOffset)
+ACCESSORS(JSMessageObject, shared_info, Object, kSharedInfoOffset)
 ACCESSORS(JSMessageObject, bytecode_offset, Smi, kBytecodeOffsetOffset)
 SMI_ACCESSORS(JSMessageObject, start_position, kStartPositionOffset)
 SMI_ACCESSORS(JSMessageObject, end_position, kEndPositionOffset)
@@ -609,13 +627,13 @@ SMI_ACCESSORS(JSMessageObject, raw_type, kMessageTypeOffset)
 DEF_GETTER(JSObject, GetElementsKind, ElementsKind) {
   ElementsKind kind = map(cage_base).elements_kind();
 #if VERIFY_HEAP && DEBUG
-  FixedArrayBase fixed_array = FixedArrayBase::unchecked_cast(
+  Tagged<FixedArrayBase> fixed_array = FixedArrayBase::unchecked_cast(
       TaggedField<HeapObject, kElementsOffset>::load(cage_base, *this));
 
   // If a GC was caused while constructing this object, the elements
   // pointer may point to a one pointer filler map.
   if (ElementsAreSafeToExamine(cage_base)) {
-    Map map = fixed_array.map(cage_base);
+    Tagged<Map> map = fixed_array->map(cage_base);
     if (IsSmiOrObjectElementsKind(kind)) {
       DCHECK(map == GetReadOnlyRoots(cage_base).fixed_array_map() ||
              map == GetReadOnlyRoots(cage_base).fixed_cow_array_map());

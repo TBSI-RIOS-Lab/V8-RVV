@@ -33,18 +33,18 @@ Handle<AccessorInfo> Accessors::MakeAccessor(
   Handle<AccessorInfo> info = factory->NewAccessorInfo();
   {
     DisallowGarbageCollection no_gc;
-    auto raw = *info;
-    raw.set_all_can_read(false);
-    raw.set_all_can_write(false);
-    raw.set_is_special_data_property(true);
-    raw.set_is_sloppy(false);
-    raw.set_replace_on_access(false);
-    raw.set_getter_side_effect_type(SideEffectType::kHasSideEffect);
-    raw.set_setter_side_effect_type(SideEffectType::kHasSideEffect);
-    raw.set_name(*name);
-    raw.set_getter(isolate, reinterpret_cast<Address>(getter));
+    Tagged<AccessorInfo> raw = *info;
+    raw->set_all_can_read(false);
+    raw->set_all_can_write(false);
+    raw->set_is_special_data_property(true);
+    raw->set_is_sloppy(false);
+    raw->set_replace_on_access(false);
+    raw->set_getter_side_effect_type(SideEffectType::kHasSideEffect);
+    raw->set_setter_side_effect_type(SideEffectType::kHasSideEffect);
+    raw->set_name(*name);
+    raw->set_getter(isolate, reinterpret_cast<Address>(getter));
     if (setter == nullptr) setter = &ReconfigureToDataProperty;
-    raw.set_setter(isolate, reinterpret_cast<Address>(setter));
+    raw->set_setter(isolate, reinterpret_cast<Address>(setter));
   }
   return info;
 }
@@ -402,8 +402,8 @@ Handle<AccessorInfo> Accessors::MakeFunctionNameInfo(Isolate* isolate) {
 
 namespace {
 
-Handle<JSObject> ArgumentsForInlinedFunction(JavaScriptFrame* frame,
-                                             int inlined_frame_index) {
+Handle<JSObject> ArgumentsFromDeoptInfo(JavaScriptFrame* frame,
+                                        int inlined_frame_index) {
   Isolate* isolate = frame->isolate();
   Factory* factory = isolate->factory();
 
@@ -467,7 +467,7 @@ Handle<JSObject> GetFrameArguments(Isolate* isolate,
     // correct number of arguments and no allocated arguments object, so
     // we can construct a fresh one by interpreting the function's
     // deoptimization input data.
-    return ArgumentsForInlinedFunction(frame, function_index);
+    return ArgumentsFromDeoptInfo(frame, function_index);
   }
 
   // Construct an arguments object mirror for the right frame and the underlying
@@ -491,6 +491,20 @@ Handle<JSObject> GetFrameArguments(Isolate* isolate,
     array->set(i, value);
   }
   arguments->set_elements(*array);
+
+  // For optimized functions, the frame arguments may be outdated, so we should
+  // update them with the deopt info, while keeping the length and extra
+  // arguments from the actual frame.
+  if (CodeKindCanDeoptimize(frame->LookupCode().kind()) && length > 0) {
+    Handle<JSObject> arguments_from_deopt_info =
+        ArgumentsFromDeoptInfo(frame, function_index);
+    Handle<FixedArray> elements_from_deopt_info(
+        FixedArray::cast(arguments_from_deopt_info->elements()), isolate);
+    int common_length = std::min(length, elements_from_deopt_info->length());
+    for (int i = 0; i < common_length; i++) {
+      array->set(i, elements_from_deopt_info->get(i));
+    }
+  }
 
   // Return the freshly allocated arguments object.
   return arguments;
@@ -836,34 +850,35 @@ Handle<AccessorInfo> Accessors::MakeWrappedFunctionNameInfo(Isolate* isolate) {
 //
 
 void Accessors::ErrorStackGetter(
-    v8::Local<v8::Name> key, const v8::PropertyCallbackInfo<v8::Value>& info) {
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
   Isolate* isolate = reinterpret_cast<Isolate*>(info.GetIsolate());
   HandleScope scope(isolate);
-  Handle<Object> formatted_stack;
-  Handle<JSObject> error_object =
-      Handle<JSObject>::cast(Utils::OpenHandle(*info.Holder()));
-  if (!ErrorUtils::GetFormattedStack(isolate, error_object)
-           .ToHandle(&formatted_stack)) {
-    isolate->OptionalRescheduleException(false);
-    return;
+  Handle<Object> formatted_stack = isolate->factory()->undefined_value();
+  Handle<JSReceiver> maybe_error_object = Utils::OpenHandle(*info.This());
+  if (maybe_error_object->IsJSObject()) {
+    if (!ErrorUtils::GetFormattedStack(
+             isolate, Handle<JSObject>::cast(maybe_error_object))
+             .ToHandle(&formatted_stack)) {
+      isolate->OptionalRescheduleException(false);
+      return;
+    }
   }
-  info.GetReturnValue().Set(Utils::ToLocal(formatted_stack));
+  v8::Local<v8::Value> result = Utils::ToLocal(formatted_stack);
+  CHECK(result->IsValue());
+  info.GetReturnValue().Set(result);
 }
 
 void Accessors::ErrorStackSetter(
-    v8::Local<v8::Name> name, v8::Local<v8::Value> value,
-    const v8::PropertyCallbackInfo<v8::Boolean>& info) {
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
   Isolate* isolate = reinterpret_cast<Isolate*>(info.GetIsolate());
   HandleScope scope(isolate);
-  Handle<JSObject> error_object =
-      Handle<JSObject>::cast(Utils::OpenHandle(*info.Holder()));
-  ErrorUtils::SetFormattedStack(isolate, error_object,
-                                Utils::OpenHandle(*value));
-}
-
-Handle<AccessorInfo> Accessors::MakeErrorStackInfo(Isolate* isolate) {
-  return MakeAccessor(isolate, isolate->factory()->stack_string(),
-                      &ErrorStackGetter, &ErrorStackSetter);
+  Handle<JSReceiver> maybe_error_object = Utils::OpenHandle(*info.This());
+  if (maybe_error_object->IsJSObject()) {
+    v8::Local<v8::Value> value = info[0];
+    ErrorUtils::SetFormattedStack(isolate,
+                                  Handle<JSObject>::cast(maybe_error_object),
+                                  Utils::OpenHandle(*value));
+  }
 }
 
 }  // namespace internal
