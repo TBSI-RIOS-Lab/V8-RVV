@@ -250,6 +250,9 @@ void InstructionSelector::VisitStore(Node* node) {
       case MachineRepresentation::kSimd128:
         opcode = kRiscvRvvSt;
         break;
+      case MachineRepresentation::kSimdv:
+        opcode = kRiscvRvvStV;
+        break;
       case MachineRepresentation::kCompressedPointer:  // Fall through.
       case MachineRepresentation::kCompressed:
         UNREACHABLE();

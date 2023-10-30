@@ -134,9 +134,12 @@
 #include "src/wasm/wasm-engine.h"
 #endif  // V8_ENABLE_WEBASSEMBLY
 
+/*
 #if V8_ENABLE_WASM_SIMD256_REVEC
 #include "src/compiler/revectorizer.h"
 #endif  // V8_ENABLE_WASM_SIMD256_REVEC
+*/
+#include "src/compiler/kvectorizer.h"
 
 namespace v8 {
 namespace internal {
@@ -757,10 +760,12 @@ class PipelineImpl final {
   void ComputeScheduledGraph();
   void InitializeTurboshaftPipeline();
 
+/*
 #if V8_ENABLE_WASM_SIMD256_REVEC
   void Revectorize();
 #endif  // V8_ENABLE_WASM_SIMD256_REVEC
-
+*/
+  void KVectorize();
   // Substep B.2. Select instructions from a scheduled graph.
   bool SelectInstructions(Linkage* linkage);
 
@@ -2347,6 +2352,7 @@ struct ComputeSchedulePhase {
   }
 };
 
+/*
 #if V8_ENABLE_WASM_SIMD256_REVEC
 struct RevectorizePhase {
   DECL_PIPELINE_PHASE_CONSTANTS(Revectorizer)
@@ -2357,6 +2363,18 @@ struct RevectorizePhase {
   }
 };
 #endif  // V8_ENABLE_WASM_SIMD256_REVEC
+*/
+
+
+struct KVectorizePhase {
+  DECL_PIPELINE_PHASE_CONSTANTS(Revectorizer)
+
+  void Run(PipelineData* data, Zone* temp_zone) {
+    KVectorizer revec(temp_zone, data->graph(), data->mcgraph());
+    revec.TryRevectorize(data->info()->GetDebugName().get());
+  }
+};
+
 
 struct InstructionRangesAsJSON {
   const InstructionSequence* sequence;
@@ -3462,12 +3480,17 @@ void Pipeline::GenerateCodeForWasmFunction(
 
   pipeline.RunPrintAndVerify("V8.WasmMachineCode", true);
 
+/*
 #if V8_ENABLE_WASM_SIMD256_REVEC
   if (v8_flags.experimental_wasm_revectorize) {
     pipeline.Revectorize();
     pipeline.RunPrintAndVerify("V8.WasmRevec", true);
   }
 #endif  // V8_ENABLE_WASM_SIMD256_REVEC
+*/
+
+  pipeline.kVectorize();
+  pipeline.RunPrintAndVerify("V8.WasmKVec", true);
 
   data.BeginPhaseKind("V8.WasmOptimization");
   if (v8_flags.wasm_inlining) {
@@ -3787,9 +3810,12 @@ void PipelineImpl::InitializeTurboshaftPipeline() {
   this->data_->InitializeTurboshaftPipeline();
 }
 
+/*
 #if V8_ENABLE_WASM_SIMD256_REVEC
 void PipelineImpl::Revectorize() { Run<RevectorizePhase>(); }
 #endif  // V8_ENABLE_WASM_SIMD256_REVEC
+*/
+void PipelineImpl::KVectorize() { Run<KVectorizePhase>(); }
 
 bool PipelineImpl::SelectInstructions(Linkage* linkage) {
   auto call_descriptor = linkage->GetIncomingDescriptor();

@@ -1397,6 +1397,9 @@ void InstructionSelector::VisitUnalignedStore(Node* node) {
     case MachineRepresentation::kSimd128:
       opcode = kRiscvRvvSt;
       break;
+    case MachineRepresentation::kSimdv:
+      opcode = kRiscvRvvStV;
+      break;
     case MachineRepresentation::kSimd256:            // Fall through.
     case MachineRepresentation::kBit:                // Fall through.
     case MachineRepresentation::kCompressedPointer:  // Fall through.
