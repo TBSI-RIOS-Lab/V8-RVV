@@ -142,7 +142,7 @@
 #endif  // V8_ENABLE_WASM_SIMD256_REVEC
 */
 
-#include "src/compiler/krevectorizer.h"
+#include "src/compiler/kvectorizer.h"
 
 namespace v8 {
 namespace internal {
